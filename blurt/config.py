@@ -91,6 +91,13 @@ class Config:
     # So each user writes their own -- names, jargon, acronyms, product names.
     initial_prompt: str = ""
 
+    # Voice-assistant mode. Hold assistant_hotkey (instead of the dictation key)
+    # to issue a command -- "schedule lunch tomorrow at noon", "set a timer for
+    # 5 minutes", "open Safari". Fully local; nothing leaves the machine. The
+    # separate hotkey keeps commands from ever being confused with dictation.
+    assistant_enabled: bool = True
+    assistant_hotkey: str = "right_cmd"
+
 
 def _warn(message: str) -> None:
     """Print a warning to stderr. Never raises, even if stderr is closed."""
@@ -221,6 +228,13 @@ def _from_dict(data: Dict[str, Any]) -> Config:
         cpu_threads=_pick_int(data, "cpu_threads", defaults.cpu_threads, 0, _MAX_THREADS),
         keep_raw_history=_pick_bool(data, "keep_raw_history", defaults.keep_raw_history),
         dictionary=_pick_dictionary(data, "dictionary"),
+        initial_prompt=_pick_str(data, "initial_prompt", defaults.initial_prompt),
+        assistant_enabled=_pick_bool(
+            data, "assistant_enabled", defaults.assistant_enabled
+        ),
+        assistant_hotkey=_pick_str(
+            data, "assistant_hotkey", defaults.assistant_hotkey
+        ),
     )
 
 

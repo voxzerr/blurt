@@ -216,6 +216,9 @@ dictating.
 | `cpu_threads` | int | `0` | Threads for the ASR engine. `0` means auto: physical cores, never logical. Raising it past physical cores makes things worse. |
 | `keep_raw_history` | bool | `true` | Keep the pre-cleanup transcript in memory for the session, so you can see what the model actually heard. Never written to disk. |
 | `dictionary` | object | `{}` | Literal replacements applied during cleanup, e.g. `{"kubernetes": "Kubernetes"}`. Useful for names and jargon the model gets wrong the same way every time. |
+| `initial_prompt` | string | `""` | Vocabulary hint passed to Whisper — names, jargon, acronyms it keeps mishearing. A *matching* prompt measurably improves accuracy; a mismatched one can hurt, so it is empty until you fill it with your own words. |
+| `assistant_enabled` | bool | `true` | Enable command mode (the voice assistant). |
+| `assistant_hotkey` | string | `"right_cmd"` | Hold-to-command key. Same key names as `hotkey`; must differ from it. |
 
 Anything can be overridden for a single run without editing the file:
 
@@ -250,6 +253,42 @@ something else.
 
 Pasting rather than typing is deliberate. Synthetic per-character keystrokes are
 slow, mangle non-ASCII text, and break in apps with input handling of their own.
+
+## Command mode (the voice assistant)
+
+blurt has a second hotkey — **Right Command** by default — that treats what you
+say as a *command* instead of text to paste. Hold it, speak, release:
+
+| Say | It does |
+| --- | --- |
+| "schedule lunch with Sam tomorrow at noon" | Creates a real calendar event |
+| "remind me to call the dentist" | Creates a reminder |
+| "set a timer for 5 minutes" | Starts a timer, notifies you when it's up |
+| "open Safari" | Launches the app |
+| anything it doesn't recognise | Falls back to dictation — nothing is lost |
+
+It is **fully local**. Calendar and reminders go through macOS EventKit on your
+own machine; nothing is sent anywhere. The command hotkey is deliberately
+separate from the dictation hotkey so a command is never mistaken for text you
+wanted typed, and the reverse.
+
+Intent matching is deterministic and conservative — "add milk" is treated as
+dictation, not a calendar event, because it names no time and no calendar. The
+natural-language time parser understands "tomorrow at 2:30", "next friday",
+"in half an hour", "at noon", and similar.
+
+First use of a calendar or reminder command triggers the macOS Calendar/Reminders
+permission prompt, granted (like the mic) to the terminal that launched blurt.
+
+**Asking questions** ("what's the capital of France", "summarise this") is
+scaffolded but **off** — it needs a language model, which is the one thing that
+can't run well locally on older Intel Macs. That will arrive as an explicitly
+opt-in mode: a local model on Apple Silicon, or the Claude API with a clear,
+announced carve-out to the "nothing leaves your machine" promise. It is off by
+default and never sends anything anywhere until you turn it on.
+
+Turn command mode off, or change its key, in the config (`assistant_enabled`,
+`assistant_hotkey`).
 
 ## What it deliberately does not do
 

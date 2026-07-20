@@ -57,6 +57,8 @@ from typing import Any, Deque, Dict, List, Optional
 from collections import deque
 
 from . import hardware as _hardware
+from .assistant import build_default_router
+from .assistant.types import ActionResult
 from .audio import AudioUnavailable, Recorder
 from .cleanup import clean
 from .config import Config, load_config
@@ -135,6 +137,14 @@ class BlurtApp:
         self._engine_label: str = "unknown"
         self._recorder: Optional[Recorder] = None
         self._hotkey: Optional[HoldToTalk] = None
+        # Assistant (command) mode: a second hotkey routes speech to actions
+        # instead of pasting it. None when disabled or unavailable.
+        self._assistant_hotkey: Optional[HoldToTalk] = None
+        self._router: Optional[Any] = None
+        # Which mode the CURRENT capture is for. Set on hold-start, read when the
+        # capture is handed to the worker. Guards against both keys at once by
+        # ignoring a second start while one is already armed.
+        self._capture_mode: Optional[str] = None
 
         self._jobs: "queue.Queue[Any]" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
@@ -190,6 +200,7 @@ class BlurtApp:
 
         self._recorder = self._open_recorder()
         self._hotkey = self._build_hotkey()
+        self._build_assistant()
 
         self._check_accessibility()
 
@@ -209,9 +220,24 @@ class BlurtApp:
                 "Security, then try again."
             ) from exc
 
+        if self._assistant_hotkey is not None:
+            try:
+                self._assistant_hotkey.start()
+            except Exception as exc:  # noqa: BLE001 - degrade, don't die
+                # The assistant is a bonus; a failure to bind its key must not
+                # take down dictation, which is the core function.
+                _warn(f"  assistant hotkey unavailable: {type(exc).__name__}: {exc}")
+                self._assistant_hotkey = None
+
         self._started = True
         _say("")
         _say(f"Ready. Hold {self._hotkey.key_name} to dictate, Esc while holding to cancel.")
+        if self._assistant_hotkey is not None:
+            _say(
+                f"Hold {self._assistant_hotkey.key_name} to issue a command "
+                '("schedule lunch tomorrow at noon", "set a timer for 5 minutes", '
+                '"open Safari").'
+            )
         _say("Ctrl+C to quit.")
         _say("")
 
@@ -303,6 +329,57 @@ class BlurtApp:
                 "  Fix: python3 -m pip install pynput"
             ) from exc
 
+    def _build_assistant(self) -> None:
+        """Wire the command-mode router and its hotkey. Never fatal.
+
+        The assistant is an addition to dictation, not a requirement for it, so
+        every failure here degrades to "assistant off" with a warning rather than
+        aborting startup. The router's dictate fallback is _deliver, so an
+        unrecognised command is simply typed out.
+        """
+        if not getattr(self.cfg, "assistant_enabled", False):
+            return
+
+        assistant_key = getattr(self.cfg, "assistant_hotkey", "") or ""
+        if not assistant_key or assistant_key == self.cfg.hotkey:
+            if assistant_key == self.cfg.hotkey:
+                _warn(
+                    "  assistant hotkey equals the dictation hotkey; "
+                    "assistant mode disabled to avoid a conflict."
+                )
+            return
+
+        try:
+            self._router = build_default_router(
+                dictate_fallback=self._deliver_as_result
+            )
+        except Exception as exc:  # noqa: BLE001 - assistant is optional
+            _warn(f"  assistant unavailable: {type(exc).__name__}: {exc}")
+            self._router = None
+            return
+
+        try:
+            self._assistant_hotkey = HoldToTalk(
+                key_name=assistant_key,
+                on_start=self._on_assistant_start,
+                on_stop=self._on_assistant_stop,
+                on_cancel=self._on_assistant_cancel,
+                min_hold_ms=self.cfg.min_hold_ms,
+            )
+        except UnsupportedHotkeyError as exc:
+            _warn(f"  assistant hotkey {assistant_key!r} unsupported: {exc}")
+            self._assistant_hotkey = None
+            self._router = None
+        except Exception as exc:  # noqa: BLE001 - degrade, don't die
+            _warn(f"  assistant hotkey unavailable: {type(exc).__name__}: {exc}")
+            self._assistant_hotkey = None
+            self._router = None
+
+    def _deliver_as_result(self, text: str) -> "ActionResult":
+        """Dictate fallback for the router: paste the text, report it as a result."""
+        self._deliver(text)
+        return ActionResult(ok=True, message=f"Dictated: {text}")
+
     def _check_accessibility(self) -> None:
         """Warn -- do not fail -- when the host app is untrusted.
 
@@ -323,10 +400,17 @@ class BlurtApp:
     # These run on pynput's dispatch thread. They must stay cheap: anything slow
     # here delays the next key press.
 
-    def _on_hold_start(self) -> None:
+    def _begin_capture(self, mode: str) -> None:
+        """Start recording for ``mode`` ("dictate" or "assistant").
+
+        If a capture is already in progress -- e.g. both hotkeys held at once --
+        the second start is ignored, because one recorder cannot serve two takes.
+        """
         recorder = self._recorder
         if recorder is None:
             return
+        if self._capture_mode is not None:
+            return  # already recording in some mode; do not clobber it
         try:
             recorder.start()
         except AudioUnavailable as exc:
@@ -335,12 +419,14 @@ class BlurtApp:
         except Exception as exc:  # noqa: BLE001 - never kill the listener thread
             _warn(f"blurt: cannot record: {type(exc).__name__}: {exc}")
             return
-        _say("  recording...")
+        self._capture_mode = mode
+        _say("  listening for a command..." if mode == "assistant" else "  recording...")
 
-    def _on_hold_stop(self) -> None:
+    def _end_capture(self, mode: str) -> None:
+        """Stop recording and queue the capture, tagged with its mode."""
         recorder = self._recorder
-        if recorder is None:
-            return
+        if recorder is None or self._capture_mode != mode:
+            return  # not our capture (or none in progress)
         try:
             pcm = recorder.stop()
             # Read the silence verdict NOW. It is per-recorder state that the next
@@ -349,21 +435,45 @@ class BlurtApp:
             overflowed = recorder.last_capture_overflowed()
         except Exception as exc:  # noqa: BLE001 - never kill the listener thread
             _warn(f"blurt: capture failed: {type(exc).__name__}: {exc}")
+            self._capture_mode = None
             return
+        finally:
+            self._capture_mode = None
 
         # Hand off immediately. Transcription is seconds of work and does not
         # belong on the thread that has to notice the next key press.
-        self._jobs.put((pcm, was_silent, overflowed))
+        self._jobs.put((pcm, was_silent, overflowed, mode))
 
-    def _on_hold_cancel(self) -> None:
+    def _cancel_capture(self, mode: str) -> None:
         recorder = self._recorder
-        if recorder is None:
+        if recorder is None or self._capture_mode != mode:
             return
         try:
             recorder.stop()  # discard the audio; nothing is queued
         except Exception:  # noqa: BLE001 - cancelling must never raise
             pass
+        self._capture_mode = None
         _say("  cancelled")
+
+    # Dictation hotkey callbacks.
+    def _on_hold_start(self) -> None:
+        self._begin_capture("dictate")
+
+    def _on_hold_stop(self) -> None:
+        self._end_capture("dictate")
+
+    def _on_hold_cancel(self) -> None:
+        self._cancel_capture("dictate")
+
+    # Assistant (command) hotkey callbacks.
+    def _on_assistant_start(self) -> None:
+        self._begin_capture("assistant")
+
+    def _on_assistant_stop(self) -> None:
+        self._end_capture("assistant")
+
+    def _on_assistant_cancel(self) -> None:
+        self._cancel_capture("assistant")
 
     # -- worker -------------------------------------------------------------
 
@@ -374,15 +484,17 @@ class BlurtApp:
             try:
                 if job is _STOP:
                     return
-                pcm, was_silent, overflowed = job
-                self._handle_capture(pcm, was_silent, overflowed)
+                pcm, was_silent, overflowed, mode = job
+                self._handle_capture(pcm, was_silent, overflowed, mode)
             except Exception:  # noqa: BLE001 - one bad dictation must not end the loop
                 _log.exception("transcription job failed")
                 _warn("blurt: that dictation failed; the app is still running.")
             finally:
                 self._jobs.task_done()
 
-    def _handle_capture(self, pcm: Any, was_silent: bool, overflowed: bool) -> None:
+    def _handle_capture(
+        self, pcm: Any, was_silent: bool, overflowed: bool, mode: str = "dictate"
+    ) -> None:
         """Transcribe one capture, clean it, and get it in front of the user."""
         engine = self._engine
         if engine is None:
@@ -443,7 +555,38 @@ class BlurtApp:
             _warn("  heard audio but no speech was recognised.")
             return
 
-        self._deliver(cleaned)
+        if mode == "assistant" and self._router is not None:
+            self._handle_command(cleaned)
+        else:
+            self._deliver(cleaned)
+
+    def _handle_command(self, text: str) -> None:
+        """Route a spoken command to an action and run it, announcing the result.
+
+        The router's dictate fallback (wired in startup) pastes the text when no
+        command matches, so nothing a user says is ever silently dropped.
+        """
+        from .assistant.system_actions import notify
+
+        router = self._router
+        try:
+            action = router.route(text)
+            result = router.execute(action)
+        except Exception as exc:  # noqa: BLE001 - a bad command must not crash the app
+            _log.exception("assistant command failed")
+            _warn(f"  command failed: {type(exc).__name__}: {exc}")
+            return
+
+        message = getattr(result, "message", "") or ""
+        ok = bool(getattr(result, "ok", False))
+        _say(f"  {'OK' if ok else 'x'} {message}")
+        # A desktop notification too, since the user is usually in another app
+        # when issuing a command and will not be looking at this terminal.
+        if getattr(action, "kind", "") != "dictate":
+            try:
+                notify("blurt", message)
+            except Exception:  # noqa: BLE001 - notification is best-effort
+                pass
 
     def _report_timing(self, transcript: Transcript) -> None:
         """Print real numbers for this machine.
@@ -598,13 +741,14 @@ class BlurtApp:
         self._shut_down = True
         self._stop_event.set()
 
-        hotkey = self._hotkey
-        self._hotkey = None
-        if hotkey is not None:
-            try:
-                hotkey.stop()
-            except Exception:  # noqa: BLE001 - teardown is best effort
-                _log.debug("hotkey stop failed", exc_info=True)
+        for attr in ("_hotkey", "_assistant_hotkey"):
+            hotkey = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if hotkey is not None:
+                try:
+                    hotkey.stop()
+                except Exception:  # noqa: BLE001 - teardown is best effort
+                    _log.debug("%s stop failed", attr, exc_info=True)
 
         worker = self._worker
         self._worker = None

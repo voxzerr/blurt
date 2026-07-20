@@ -23,6 +23,10 @@ dependencies = [
     "pyobjc-core",
     "pyobjc-framework-Cocoa",
     "pyobjc-framework-Quartz",
+    # Calendar/reminders for the voice-assistant command mode. The assistant
+    # degrades gracefully if this is missing, but it is on by default, so it
+    # belongs in the base install.
+    "pyobjc-framework-EventKit",
 ]
 
 classifiers = [

@@ -648,3 +648,44 @@ def test_a_loaded_dictionary_is_usable_by_cleanup(tmp_path):
 def test_config_is_json_serializable_via_dataclasses_asdict():
     payload: Dict[str, Any] = dataclasses.asdict(Config())
     assert json.loads(json.dumps(payload)) == payload
+
+
+def test_EVERY_field_round_trips_through_save_and_load(tmp_path):
+    # Regression guard for a real bug: _from_dict lists fields explicitly, so a
+    # newly added Config field silently fails to load until it is wired in there.
+    # This test fails the moment any field does not survive save -> load, without
+    # anyone having to remember to test the new field by hand.
+    path = tmp_path / "config.json"
+
+    # A non-default value for every field, so a dropped field shows as a mismatch.
+    custom = Config(
+        engine="faster-whisper",
+        model="base.en",
+        hotkey="right_ctrl",
+        cleanup_level="standard",
+        sample_rate=24000,
+        preroll_ms=300,
+        min_hold_ms=150,
+        paste_delay_ms=90,
+        clipboard_restore_ms=350,
+        cpu_threads=3,
+        keep_raw_history=False,
+        dictionary={"oauth": "OAuth"},
+        initial_prompt="OAuth, Kubernetes, voxzerr",
+        assistant_enabled=False,
+        assistant_hotkey="right_ctrl",
+    )
+    # Guard against the test itself going stale: if a field is added to Config
+    # but not given a non-default value above, this catches it.
+    for f in dataclasses.fields(Config):
+        assert getattr(custom, f.name) != getattr(Config(), f.name), (
+            "field %r has no non-default value in this test; add one" % f.name
+        )
+
+    save_config(custom, path)
+    loaded = load_config(path)
+
+    for f in dataclasses.fields(Config):
+        assert getattr(loaded, f.name) == getattr(custom, f.name), (
+            "field %r did not survive save->load -- wire it into _from_dict" % f.name
+        )

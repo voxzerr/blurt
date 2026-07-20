@@ -103,6 +103,14 @@ _TARGET_PEAK = 0.95
 # rather than full scale.
 _MAX_GAIN = 200.0
 _NORMALIZE_FLOOR_PEAK = 5e-4
+# RMS floor. This one is delicate: it has to sit ABOVE measured room tone
+# (rms 0.000225-0.000535 on the reference machine) so ambient noise is not
+# amplified, but BELOW real speech so quiet talkers are still rescued -- the
+# whole point of normalization. 7e-4 threads that gap. Set it much higher and
+# it re-breaks the quiet-speech fix; much lower and spiky room tone slips
+# through. Speech with an rms below this has essentially no SNR to recover
+# anyway, so leaving it for VAD is the right call.
+_NORMALIZE_FLOOR_RMS = 7e-4
 
 
 def _normalize_gain(pcm: "np.ndarray") -> "np.ndarray":
@@ -114,8 +122,15 @@ def _normalize_gain(pcm: "np.ndarray") -> "np.ndarray":
     if pcm.size == 0:
         return pcm
     peak = float(np.max(np.abs(pcm)))
-    # Too quiet to be speech -- leave it for the silence check and VAD to handle.
-    if peak < _NORMALIZE_FLOOR_PEAK:
+    # Two independent "too quiet to be speech" floors, and BOTH must be cleared
+    # before we amplify. The peak floor alone is not enough: measured real room
+    # tone had rms 0.000535 but a peak of 0.028 (a few transient clicks), which
+    # sails over a peak-only guard and would get a ~33x boost -- turning silence
+    # into a speech-level roar. Adding the RMS floor closes that path. (VAD would
+    # currently catch the amplified noise downstream, but relying on a second
+    # system to clean up after this one is how latent bugs are born.)
+    rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
+    if peak < _NORMALIZE_FLOOR_PEAK or rms < _NORMALIZE_FLOOR_RMS:
         return pcm
     # Already at a healthy level; don't touch it.
     if peak >= _TARGET_PEAK:

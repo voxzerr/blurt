@@ -16,6 +16,7 @@ import pytest
 from blurt.audio import (
     _MAX_GAIN,
     _NORMALIZE_FLOOR_PEAK,
+    _NORMALIZE_FLOOR_RMS,
     _TARGET_PEAK,
     _normalize_gain,
 )
@@ -66,6 +67,23 @@ def test_near_silence_is_NOT_amplified():
     almost_nothing = _tone(_NORMALIZE_FLOOR_PEAK / 2.0)
     out = _normalize_gain(almost_nothing)
     assert np.allclose(out, almost_nothing)
+
+
+def test_spiky_room_tone_is_NOT_amplified():
+    # The hallucination path this guard exists to close: low overall energy
+    # (rms below the floor) but a few transient clicks pushing the PEAK above
+    # the peak floor. A peak-only guard would amplify this ~33x and hand Whisper
+    # speech-level noise. Both floors together must leave it alone.
+    n = 16000
+    rng = np.random.RandomState(0)
+    quiet_noise = (rng.randn(n).astype(np.float32) * (_NORMALIZE_FLOOR_RMS / 3.0))
+    # a couple of clicks that clear the peak floor but not the rms floor
+    quiet_noise[100] = _NORMALIZE_FLOOR_PEAK * 20
+    quiet_noise[5000] = -_NORMALIZE_FLOOR_PEAK * 20
+    assert float(np.max(np.abs(quiet_noise))) > _NORMALIZE_FLOOR_PEAK  # peak clears
+    assert float(np.sqrt(np.mean(quiet_noise ** 2))) < _NORMALIZE_FLOOR_RMS  # rms does not
+    out = _normalize_gain(quiet_noise)
+    assert np.allclose(out, quiet_noise), "spiky room tone was amplified -- hallucination path is open"
 
 
 def test_digital_silence_is_untouched_and_does_not_divide_by_zero():

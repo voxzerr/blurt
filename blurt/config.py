@@ -85,6 +85,12 @@ class Config:
     keep_raw_history: bool = True
     dictionary: Dict[str, str] = field(default_factory=dict)
 
+    # Free-text hint passed to Whisper as initial_prompt. Empty by default: a
+    # domain prompt measurably helps accuracy (+4pp WER, p=0.001) BUT a
+    # mismatched prompt can regress, and we cannot know a stranger's vocabulary.
+    # So each user writes their own -- names, jargon, acronyms, product names.
+    initial_prompt: str = ""
+
 
 def _warn(message: str) -> None:
     """Print a warning to stderr. Never raises, even if stderr is closed."""

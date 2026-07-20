@@ -14,16 +14,28 @@ constructing a ``WhisperModel`` takes seconds, and paying that on the first
 utterance makes the app feel broken exactly when the user is deciding whether to
 trust it.
 
-Latency, measured (int8, 4 threads, floor machine):
+Latency, RE-MEASURED at the correct 2 threads (int8, floor machine, warm median
+of 3, ~2.8s clip). The earlier numbers in this file were taken at 4 threads,
+which on a 2-core machine oversubscribes the hyperthreads and inflates every
+figure by up to 9x -- see hardware.py for why physical cores are the right count:
 
-    tiny.en   2.06s for 13.8s audio  |  2.77s for  2.7s audio
-    base.en   4.06s for 13.8s audio  |  5.24s for  2.7s audio
-    small.en  8.27s for 13.8s audio  | 24.50s for  2.7s audio  <- unusable
+    base.en   beam=1  0.79s   |  beam=5  0.85s
+    small.en  beam=1  2.46s   |  beam=5  2.76s
 
-Read those numbers carefully: the SHORT clip is not faster. Whisper pads every
-input to a 30-second window, so latency is roughly constant regardless of how
-briefly the user speaks. Anything in the UI that promises "quick for short
-phrases" is lying.
+Two corrections to what this file used to claim:
+
+  - small.en is NOT "24.50s -- unusable". That was the 4-thread artifact. At the
+    correct thread count it is ~2.5s, which is a usable "accuracy mode" -- slower
+    than base.en but not remotely unusable. It is offered as an explicit toggle,
+    not the default, because ~2.5s vs ~0.85s is a real interactive-latency
+    tradeoff the user should choose.
+  - A wider beam is nearly free here: beam_size=5 costs ~+60ms over greedy,
+    because Whisper pads every input to a fixed 30-second window so the encoder
+    cost is constant and the beam only multiplies the short decoder pass.
+
+The SHORT clip is still not faster than a long one, for that same 30-second-
+padding reason: latency is roughly constant regardless of how briefly the user
+speaks. Anything in the UI that promises "quick for short phrases" is lying.
 
 What can go wrong on macOS:
 
@@ -79,9 +91,13 @@ ENGINE_NAME = "faster-whisper"
 # Whisper's native rate. Everything else has to be resampled to this.
 _WHISPER_SAMPLE_RATE = 16000
 
-# beam_size=1 (greedy). Every timing in this project was measured with it, and
-# on a 2-core machine a wider beam costs more than the accuracy is worth.
-_BEAM_SIZE = 1
+# beam_size=5. The comment that used to sit here claimed a wider beam "costs more
+# than the accuracy is worth on a 2-core machine". That was measurably false:
+# beam=5 vs beam=1 costs ~+60ms on the floor machine (0.79s -> 0.85s), because the
+# fixed 30-second encoder pass dominates and the beam only widens the short
+# decoder pass. The accuracy gain is modest and not always statistically
+# significant, but at +60ms it is close to free, so we take it.
+_BEAM_SIZE = 5
 
 # Cached result of importing faster_whisper, so that repeated is_available()
 # calls cost nothing. None means "not attempted yet".
@@ -283,9 +299,9 @@ class FasterWhisperEngine(ASREngine):
     def resolve_model(self) -> str:
         """The model size this engine will actually load.
 
-        ``model="auto"`` defers to ``hardware.recommend_model``, which refuses to
-        hand small.en to a slow machine -- 24.5s for a 2.7s utterance is not a
-        product.
+        ``model="auto"`` defers to ``hardware.recommend_model``. On a slow machine
+        that resolves to base.en as the default; small.en is available as an
+        explicit "accuracy mode" choice (~2.5s vs ~0.85s), not the auto pick.
         """
         configured = (self._cfg.model or "auto").strip()
         if configured and configured != "auto":
@@ -394,6 +410,9 @@ class FasterWhisperEngine(ASREngine):
             # hallucinate words out of room tone.
             vad_filter=True,
             language=self._language_hint(),
+            # User-supplied vocabulary bias (names, jargon, acronyms). Empty
+            # unless the user set it; None keeps faster-whisper's own default.
+            initial_prompt=self._initial_prompt(),
         )
 
         # `segments` is a lazy generator: the actual work happens as it is
@@ -422,3 +441,12 @@ class FasterWhisperEngine(ASREngine):
         """
         model_size = getattr(self, "_loaded_model_size", None) or self.resolve_model()
         return "en" if model_size.endswith(".en") else None
+
+    def _initial_prompt(self) -> Optional[str]:
+        """The user's vocabulary hint, or None when they have not set one.
+
+        Returns None rather than "" so faster-whisper keeps its own default
+        behaviour when the field is empty, instead of being handed a blank prompt.
+        """
+        prompt = (getattr(self._cfg, "initial_prompt", "") or "").strip()
+        return prompt or None

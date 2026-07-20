@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blurt"
+version = "0.1.0"
+description = "Local voice dictation for macOS. Hold a key, talk, release."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "voxzerr" }]
+keywords = ["dictation", "speech-to-text", "whisper", "macos", "offline"]
+
+# Kept deliberately small. Every one of these installs from a prebuilt wheel on
+# macOS 13 with Python 3.9 and no Homebrew, no cmake, no ffmpeg, no Xcode.
+# sounddevice bundles its own PortAudio, which is why there is no system audio
+# dependency to install first.
+dependencies = [
+    "numpy",
+    "sounddevice",
+    "pynput",
+    "pyobjc-core",
+    "pyobjc-framework-Cocoa",
+    "pyobjc-framework-Quartz",
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: MacOS X",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Operating System :: MacOS",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Utilities",
+]
+
+[project.optional-dependencies]
+# The engine you actually want. Pinned at >=1.2 because that is the first
+# release verified to import and transcribe on the Intel floor machine.
+whisper = ["faster-whisper>=1.2"]
+
+# Apple's on-device Speech framework as a fallback engine.
+speech = ["pyobjc-framework-Speech"]
+
+dev = ["pytest"]
+
+[project.scripts]
+blurt = "blurt.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["blurt*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

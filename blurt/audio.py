@@ -70,6 +70,60 @@ __all__ = ["AudioUnavailable", "Recorder"]
 # without flagging a genuinely soft speaker as a permission failure.
 _SILENCE_RMS = 1e-4
 
+# --- gain normalization ----------------------------------------------------
+#
+# Whisper is trained on roughly normalized audio, and it degrades badly when fed
+# a very quiet signal. This is not a theoretical concern -- measured on this
+# project's reference machine with base.en, using identical synthesized speech
+# attenuated to different levels:
+#
+#     input rms 0.0014   raw ->  0.0% word error rate
+#     input rms 0.0002   raw -> 26.5% word error rate
+#     input rms 0.0002   peak-normalized ->  0.0% word error rate
+#
+# The failure mode is the nasty kind: at 0.0002 the model silently DROPPED the
+# first seven words of the utterance rather than garbling them, so the output
+# looks like a confident, fluent, wrong transcript. A user experiences that as
+# "it isn't transcribing what I said".
+#
+# Normalizing costs nothing measurable (1.78s vs 1.79s on the same clip), so it
+# is applied unconditionally to every capture.
+#
+# Two guards keep this from making things worse:
+#   * Near-silent input is left alone. Amplifying a room-tone-only buffer to full
+#     scale invites Whisper to hallucinate speech out of noise.
+#   * Gain is capped. Without a ceiling, a buffer whose peak is 1e-6 would be
+#     multiplied by ~950,000, turning the noise floor into a roar.
+_TARGET_PEAK = 0.95
+# The floor below, not this cap, is what stops us amplifying room tone -- so the
+# cap only needs to bound the absurd case. 60x was the first value tried and it
+# was too tight: a peak of 0.01 needs 95x to reach target and got stuck at 0.6.
+# 200x reaches target for anything at or above a 0.005 peak, which covers a very
+# quiet speaker, while still bounding a just-above-the-floor buffer to ~0.12
+# rather than full scale.
+_MAX_GAIN = 200.0
+_NORMALIZE_FLOOR_PEAK = 5e-4
+
+
+def _normalize_gain(pcm: "np.ndarray") -> "np.ndarray":
+    """Scale quiet audio up toward _TARGET_PEAK, with silence and gain guards.
+
+    Peak normalization rather than RMS: both measured identically (0.0% WER) on
+    the reference clip, and peak has no clipping to defend against.
+    """
+    if pcm.size == 0:
+        return pcm
+    peak = float(np.max(np.abs(pcm)))
+    # Too quiet to be speech -- leave it for the silence check and VAD to handle.
+    if peak < _NORMALIZE_FLOOR_PEAK:
+        return pcm
+    # Already at a healthy level; don't touch it.
+    if peak >= _TARGET_PEAK:
+        return pcm
+    gain = min(_TARGET_PEAK / peak, _MAX_GAIN)
+    return (pcm * gain).astype(np.float32)
+
+
 # Requested block size, in seconds. ~20 ms is small enough that pre-roll is
 # accurate to within one block and large enough that the callback fires at a
 # sane rate. PortAudio may ignore this and pick its own size; nothing here
@@ -492,7 +546,8 @@ class Recorder:
         self._last_rms = _rms(raw)
         self._last_silent = self._last_rms < _SILENCE_RMS
 
-        return _resample_linear(raw, self._device_rate, self._target_rate)
+        resampled = _resample_linear(raw, self._device_rate, self._target_rate)
+        return _normalize_gain(resampled)
 
     def last_capture_was_silent(self) -> bool:
         """True when the last stop() returned silence (or effectively silence).

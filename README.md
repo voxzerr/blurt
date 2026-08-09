@@ -214,11 +214,13 @@ dictating.
 | `paste_delay_ms` | int | `120` | Wait after writing the clipboard before sending Cmd+V, so the target app sees the new contents. |
 | `clipboard_restore_ms` | int | `400` | Wait after pasting before restoring your previous clipboard. |
 | `cpu_threads` | int | `0` | Threads for the ASR engine. `0` means auto: physical cores, never logical. Raising it past physical cores makes things worse. |
-| `keep_raw_history` | bool | `true` | Keep the pre-cleanup transcript in memory for the session, so you can see what the model actually heard. Never written to disk. |
+| `keep_raw_history` | bool | `true` | Keep the pre-cleanup transcript in memory for the session, so you can see what the model actually heard. In-memory only — writing transcripts to disk is a separate, opt-in setting (`history_enabled`). |
 | `dictionary` | object | `{}` | Literal replacements applied during cleanup, e.g. `{"kubernetes": "Kubernetes"}`. Useful for names and jargon the model gets wrong the same way every time. |
 | `initial_prompt` | string | `""` | Vocabulary hint passed to Whisper — names, jargon, acronyms it keeps mishearing. A *matching* prompt measurably improves accuracy; a mismatched one can hurt, so it is empty until you fill it with your own words. |
 | `assistant_enabled` | bool | `true` | Enable command mode (the voice assistant). |
 | `assistant_hotkey` | string | `"right_cmd"` | Hold-to-command key. Same key names as `hotkey`; must differ from it. |
+| `history_enabled` | bool | `false` | Write finished dictations to a journal on disk, so `blurt learn` can suggest `dictionary` and `initial_prompt` entries. **Off by default** — this is the only thing blurt writes to disk. See below. |
+| `history_limit` | int | `2000` | Most journal records to keep. Older ones are dropped. |
 
 Anything can be overridden for a single run without editing the file:
 
@@ -229,6 +231,91 @@ blurt --hotkey right_cmd run
 
 Overrides are validated. A typo exits with an error rather than quietly running
 something else.
+
+## Learning your vocabulary
+
+Two settings do almost all the work of making blurt recognise *your* words:
+`dictionary` (fix a term after the fact) and `initial_prompt` (bias Whisper
+toward a term before it listens). Both are empty until you fill them, and
+neither is much use if you have to guess what to put in them.
+
+`blurt learn` closes that loop. Turn on the journal:
+
+```json
+{ "history_enabled": true }
+```
+
+dictate normally for a few days, then:
+
+```sh
+blurt learn              # show what it found; changes nothing
+blurt learn --apply      # review each suggestion and accept the ones you want
+blurt learn --apply --yes  # accept the high-confidence ones without asking
+blurt learn --forget     # delete the journal
+```
+
+A real report looks like this:
+
+```
+SUGGESTIONS (3: 2 high confidence, 1 worth a look)
+
+  dictionary -- literal replacements applied during cleanup
+    [high  ] github -> GitHub
+             spelled 3 ways: github (4), GitHub (2), Github (2)
+    [medium] kubernetis -> kubernetes
+             seen 2 time(s); 1 edit(s) from 'kubernetes', which you said 8 times
+
+  prompt -- vocabulary hints passed to Whisper before it listens
+    [high  ] Priya
+             always capitalized mid-sentence (8 times across 12 dictations)
+```
+
+It also tells you which of your existing dictionary entries have never matched
+anything, which is the fastest way to find one whose key is subtly wrong.
+
+### What it can and cannot learn
+
+blurt does not know what you *meant* to say. The obvious way to find out — watch
+what you edit after the text lands — means reading your keystrokes in other
+applications, which is exactly the thing blurt refuses to be. So nothing here
+infers your intent, and nothing is applied without you agreeing to it.
+
+What is visible in the transcripts alone is still worth having:
+
+- **Spelling variance.** The engine wrote `GitHub`, `github` and `Github`. One of
+  those is what you wanted, and a dictionary entry pins it. The inconsistency is
+  the evidence — no guess required.
+- **Your proper nouns.** A word capitalized in the *middle* of a sentence is one
+  the engine believes is a name. Yours are exactly what `initial_prompt` is for.
+- **Your jargon.** Words you use often that most people do not.
+- **Near-misses.** A rare token a couple of edits from one you say constantly.
+  This is the one genuinely speculative rule, and it never rises above `medium`.
+
+Every suggestion carries `high` or `medium`, and that split is the safety model:
+`--yes` applies only `high`. A suggestion you decline costs a keystroke; a wrong
+dictionary entry silently rewrites a word in every dictation from then on, and
+you might not notice which setting did it.
+
+### The honest cost
+
+This is the only feature in blurt that writes your speech to disk, which is why
+it is off until you switch it on rather than on until you notice.
+
+The journal lives at `~/.local/share/blurt/history.jsonl` (or under
+`$XDG_DATA_HOME`), mode `0600` inside a `0700` directory. It is one JSON object
+per line, so you can read, grep or edit it with the tools you already have. It
+never leaves your machine — blurt has no network path to send it down. Setting
+`keep_raw_history: false` means only cleaned text is journalled, which weakens
+some of the findings; `blurt learn` says so rather than reporting less and
+looking confident about it.
+
+`blurt learn --forget` deletes it. That is a plain unlink: on a copy-on-write
+filesystem like APFS it does not reliably destroy the underlying blocks, so it is
+not a secure erase and is not claimed to be. FileVault is what actually solves
+that.
+
+`blurt doctor` reports the journal's state — including when it is off — so you
+never have to infer whether it is running.
 
 ## How it works
 

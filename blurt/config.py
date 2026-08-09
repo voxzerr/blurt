@@ -67,6 +67,10 @@ _MAX_MS = 60000
 # More threads than this on any Mac blurt supports is a misconfiguration.
 _MAX_THREADS = 64
 
+# Upper bound on the journal size. 200k dictations is years of heavy use and
+# roughly 80 MB of JSONL; past that the cap is certainly a typo.
+_MAX_HISTORY_LIMIT = 200000
+
 
 @dataclass
 class Config:
@@ -84,6 +88,15 @@ class Config:
     cpu_threads: int = 0            # 0 = auto
     keep_raw_history: bool = True
     dictionary: Dict[str, str] = field(default_factory=dict)
+
+    # On-disk transcript journal, read by `blurt learn` to suggest dictionary and
+    # initial_prompt entries. OFF BY DEFAULT and staying that way: everything else
+    # blurt does keeps your speech transient, and this is the one thing that
+    # writes it down. Enabling it is a decision the user makes, never a default
+    # they discover. See blurt/history.py for where the file lives and how to
+    # delete it (`blurt learn --forget`).
+    history_enabled: bool = False
+    history_limit: int = 2000
 
     # Free-text hint passed to Whisper as initial_prompt. Empty by default: a
     # domain prompt measurably helps accuracy (+4pp WER, p=0.001) BUT a
@@ -234,6 +247,12 @@ def _from_dict(data: Dict[str, Any]) -> Config:
         ),
         assistant_hotkey=_pick_str(
             data, "assistant_hotkey", defaults.assistant_hotkey
+        ),
+        history_enabled=_pick_bool(
+            data, "history_enabled", defaults.history_enabled
+        ),
+        history_limit=_pick_int(
+            data, "history_limit", defaults.history_limit, 1, _MAX_HISTORY_LIMIT
         ),
     )
 

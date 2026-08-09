@@ -6,6 +6,7 @@ Subcommands::
     blurt doctor     diagnose this machine -- run this first when something is wrong
     blurt bench      measure real transcription latency HERE, not in a datasheet
     blurt config     print the resolved configuration and where it came from
+    blurt learn      review your transcript journal and personalize from it
 
 ``doctor`` is the important one. blurt's failure modes on macOS are almost all
 permission or environment problems that produce silence rather than errors: a
@@ -16,6 +17,11 @@ read. ``doctor`` exists to turn all of that into text.
 ``bench`` reports measured numbers from this specific machine. The spread is
 enormous -- tiny.en takes ~2s on a 2017 Intel i7 and a fraction of that on an
 M-series -- so quoting anyone else's figures would be dishonest.
+
+``learn`` reads the opt-in transcript journal (``history_enabled``) and proposes
+``dictionary`` and ``initial_prompt`` entries from it. It proposes; it does not
+decide. ``--apply`` walks the suggestions one at a time, ``--yes`` accepts the
+high-confidence ones unattended, and ``--forget`` deletes the journal outright.
 
 What can go wrong on macOS:
   - ``doctor`` briefly opens the microphone (about half a second) to check
@@ -35,6 +41,7 @@ import argparse
 import dataclasses
 import json
 import os
+import pathlib
 import platform
 import sys
 import time
@@ -43,12 +50,15 @@ from typing import Any, List, Optional, Sequence, Tuple
 from . import __version__
 from . import engines as _engines
 from . import hardware as _hardware
+from . import history as _history
+from . import learn as _learn
 from .config import (
     VALID_CLEANUP_LEVELS,
     VALID_ENGINES,
     Config,
     default_config_path,
     load_config,
+    save_config,
 )
 from .hotkey import SUPPORTED_HOTKEYS, UnsupportedHotkeyError, normalize_key_name
 
@@ -188,6 +198,40 @@ def _build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="print the resolved configuration and its file path",
         description="Show the effective settings and where they were read from.",
+    )
+
+    learn = sub.add_parser(
+        "learn",
+        parents=[common],
+        help="review your transcript journal and personalize blurt from it",
+        description=(
+            "Analyse the opt-in transcript journal and propose dictionary and "
+            "initial_prompt entries. Prints suggestions by default and changes "
+            "nothing without --apply."
+        ),
+    )
+    learn.add_argument(
+        "--apply",
+        action="store_true",
+        help="review each suggestion and write the accepted ones to your config",
+    )
+    learn.add_argument(
+        "--yes",
+        action="store_true",
+        help="with --apply, accept every high-confidence suggestion without asking",
+    )
+    learn.add_argument(
+        "--forget",
+        action="store_true",
+        help="delete the transcript journal and exit",
+    )
+    learn.add_argument(
+        "--min",
+        dest="min_occurrences",
+        type=int,
+        default=_learn.DEFAULT_MIN_OCCURRENCES,
+        metavar="N",
+        help="occurrences before a pattern is reported (default: %(default)s)",
     )
 
     return parser
@@ -597,6 +641,34 @@ def _doctor_config(cfg: Config, args: argparse.Namespace) -> None:
     _out("  raw history: %s" % ("kept" if cfg.keep_raw_history else "not kept"))
     if cfg.dictionary:
         _out("  dictionary : %d replacement(s)" % len(cfg.dictionary))
+    _doctor_journal(cfg)
+
+
+def _doctor_journal(cfg: Config) -> None:
+    """Report the on-disk journal, including when it is off.
+
+    Printed unconditionally rather than only when enabled. A tool that writes your
+    speech to disk should be visible in the diagnostic whether or not it is
+    currently doing it -- "off" is the answer most users need to be able to
+    confirm, and they should not have to infer it from an absent line.
+    """
+    path = _history.default_history_path()
+    if not cfg.history_enabled:
+        _out("  journal    : off (history_enabled = false)")
+        if path.exists():
+            _out(
+                "               a journal file still exists at %s -- "
+                "'blurt learn --forget' deletes it" % path
+            )
+        return
+
+    _out("  journal    : ON -- transcripts are written to disk")
+    _out("               %s" % path)
+    _out(
+        "               %d record(s), capped at %d"
+        % (_history.history_size(path), cfg.history_limit)
+    )
+    _out("               'blurt learn' reads it; 'blurt learn --forget' deletes it")
 
 
 # -- bench ------------------------------------------------------------------
@@ -894,6 +966,336 @@ def _cmd_config(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+# -- learn ------------------------------------------------------------------
+
+
+def _cmd_learn(cfg: Config, args: argparse.Namespace) -> int:
+    """Report what the transcript journal suggests, and optionally apply it.
+
+    Reads nothing but the journal and the config, and writes nothing unless
+    ``--apply`` was passed. The split is deliberate: the default invocation is
+    safe to run out of curiosity, which is the only way anyone will ever discover
+    what this command is for.
+    """
+    if getattr(args, "forget", False):
+        return _learn_forget()
+
+    path = _history.default_history_path()
+
+    if not cfg.history_enabled and not path.exists():
+        return _learn_explain_disabled(path)
+
+    records = _history.load_records(path)
+    if not records:
+        _out("blurt %s -- learn" % __version__)
+        _out("")
+        _out("  journal : %s" % path)
+        _out("  records : 0")
+        _out("")
+        if cfg.history_enabled:
+            _out("  Recording is on, but nothing has been journalled yet. Dictate for")
+            _out("  a while and come back -- suggestions need a few days of your own")
+            _out("  words before they mean anything.")
+        else:
+            _out("  Recording is off (history_enabled = false), so there is nothing")
+            _out("  to learn from yet. See 'blurt learn' with no journal for how to")
+            _out("  turn it on.")
+        return 0
+
+    report = _learn.analyze(
+        records,
+        dictionary=cfg.dictionary,
+        initial_prompt=cfg.initial_prompt,
+        min_occurrences=getattr(args, "min_occurrences", _learn.DEFAULT_MIN_OCCURRENCES),
+    )
+
+    _print_learn_report(report, path, cfg)
+
+    if not getattr(args, "apply", False):
+        if report.suggestions:
+            _out("")
+            _out("Nothing was changed. To review and apply these:")
+            _out("    blurt learn --apply")
+        return 0
+
+    return _learn_apply(report, args)
+
+
+def _learn_explain_disabled(path: pathlib.Path) -> int:
+    """Explain the feature to someone who has never turned it on.
+
+    This is the only place the trade-off gets stated before the user opts in, so
+    it states it plainly rather than selling the feature.
+    """
+    _out("blurt %s -- learn" % __version__)
+    _out("")
+    _out("  Transcript journalling is OFF, so there is nothing to learn from.")
+    _out("")
+    _out("  What it would do: keep a record of your dictations on disk, and use it")
+    _out("  to suggest 'dictionary' and 'initial_prompt' entries -- the two settings")
+    _out("  that make blurt recognise YOUR names, jargon and acronyms. blurt cannot")
+    _out("  learn those without a record; there is nothing to compare against.")
+    _out("")
+    _out("  What it costs: this is the one thing blurt writes to disk. The file is")
+    _out("  created 0600 in a 0700 directory, it never leaves your machine, and")
+    _out("  'blurt learn --forget' deletes it. Everything else blurt does keeps your")
+    _out("  speech transient, which is why this is off until you say otherwise.")
+    _out("")
+    _out("  Turn it on by adding this to %s:" % default_config_path())
+    _out("")
+    _out('      { "history_enabled": true }')
+    _out("")
+    _out("  Then dictate normally for a few days and run 'blurt learn' again.")
+    return 0
+
+
+def _learn_forget() -> int:
+    """Delete the journal, and be honest about what deleting does not do."""
+    path = _history.default_history_path()
+    removed = _history.purge_history(path)
+    if removed:
+        _out("Deleted %s" % path)
+        _out("")
+        _out("  Note: this unlinks the file. On a copy-on-write filesystem (APFS is")
+        _out("  one) that does not reliably destroy the underlying blocks, so it is")
+        _out("  not a secure erase and is not claimed to be. FileVault is what")
+        _out("  actually solves that.")
+    else:
+        _out("No journal to delete (%s)" % path)
+    return 0
+
+
+def _print_learn_report(
+    report: "_learn.Report", path: pathlib.Path, cfg: Config
+) -> None:
+    _out("blurt %s -- learn" % __version__)
+    _out("=" * 60)
+
+    _out("")
+    _out("JOURNAL")
+    _out("  path       : %s" % path)
+    _out(
+        "  records    : %d (%d dictation, %d command)"
+        % (report.records, report.dictation_records, report.assistant_records)
+    )
+    if report.span_days >= 0.01:
+        _out("  span       : %.1f days" % report.span_days)
+    _out("  audio      : %.1f minutes total" % (report.total_audio_seconds / 60.0))
+    _out("  latency    : %.2fs median" % report.median_latency_seconds)
+    if report.raw_available:
+        share = (100.0 * report.cleanup_changed / report.records) if report.records else 0.0
+        _out(
+            "  cleanup    : changed %d of %d dictations (%.0f%%) at level '%s'"
+            % (report.cleanup_changed, report.records, share, cfg.cleanup_level)
+        )
+    else:
+        _out("  cleanup    : not measurable -- keep_raw_history is off")
+        _out("               (only cleaned text was journalled, so the raw output")
+        _out("                the engine actually produced is not recoverable)")
+
+    _print_learn_suggestions(report)
+    _print_learn_dictionary_health(report)
+
+
+def _print_learn_suggestions(report: "_learn.Report") -> None:
+    _out("")
+    if not report.suggestions:
+        _out("SUGGESTIONS")
+        _out("  None. Either blurt is already transcribing you consistently, or")
+        _out("  there is not enough history yet. Try 'blurt learn --min 2' to lower")
+        _out("  the evidence threshold.")
+        return
+
+    high = len(report.high_confidence())
+    _out(
+        "SUGGESTIONS (%d: %d high confidence, %d worth a look)"
+        % (len(report.suggestions), high, len(report.suggestions) - high)
+    )
+
+    for section, kind, blurb in (
+        ("dictionary", "dictionary", "literal replacements applied during cleanup"),
+        ("prompt", "prompt", "vocabulary hints passed to Whisper before it listens"),
+    ):
+        items = report.by_kind(kind)
+        if not items:
+            continue
+        _out("")
+        _out("  %s -- %s" % (section, blurb))
+        for item in items:
+            if kind == "dictionary":
+                headline = "%s -> %s" % (item.key, item.value)
+            else:
+                headline = item.value
+            _out("    [%-6s] %s" % (item.confidence, headline))
+            _out("             %s" % item.reason)
+
+
+def _print_learn_dictionary_health(report: "_learn.Report") -> None:
+    if not (report.stale_dictionary_keys or report.noop_dictionary_keys):
+        return
+
+    _out("")
+    _out("DICTIONARY HEALTH")
+    if report.noop_dictionary_keys:
+        _out("  rewrites nothing (key and value are the same):")
+        for key in report.noop_dictionary_keys:
+            _out("    %r" % key)
+    if report.stale_dictionary_keys:
+        _out("  never matched anything in your journal:")
+        for key in report.stale_dictionary_keys:
+            _out("    %r" % key)
+        if not report.raw_available:
+            _out("")
+            _out("  Treat that list as unreliable: with keep_raw_history off, only")
+            _out("  cleaned text was journalled, and a dictionary entry that IS")
+            _out("  working has already rewritten itself out of the cleaned text.")
+
+
+def _learn_apply(report: "_learn.Report", args: argparse.Namespace) -> int:
+    """Collect approvals and write them to the config file.
+
+    Reloads the config from disk rather than reusing the in-memory one, because
+    that one has any ``--model`` / ``--cleanup`` overrides folded into it and those
+    are explicitly for one run. Persisting them here would turn a temporary
+    override into a permanent setting behind the user's back.
+    """
+    if not report.suggestions:
+        return 0
+
+    unattended = bool(getattr(args, "yes", False))
+    accepted = _collect_approvals(report, unattended)
+    if accepted is None:
+        return 1
+    if not accepted:
+        _out("")
+        _out("Nothing accepted; your config is unchanged.")
+        return 0
+
+    fresh = load_config()
+    before_dictionary = dict(fresh.dictionary)
+    before_prompt = fresh.initial_prompt
+
+    fresh.dictionary = _learn.merged_dictionary(fresh.dictionary, accepted)
+    fresh.initial_prompt = _learn.merged_prompt(fresh.initial_prompt, accepted)
+
+    added_entries = len(fresh.dictionary) - len(before_dictionary)
+    prompt_changed = fresh.initial_prompt != before_prompt
+
+    if not added_entries and not prompt_changed:
+        _out("")
+        _out("Everything accepted was already covered; your config is unchanged.")
+        return 0
+
+    path = default_config_path()
+    try:
+        save_config(fresh, path)
+    except OSError as exc:
+        _err("")
+        _err("blurt: could not write %s (%s)" % (path, exc))
+        _err("  Nothing was changed.")
+        return 1
+
+    _out("")
+    _out("Wrote %s" % path)
+    if added_entries:
+        _out("  dictionary     : %d new entr%s"
+             % (added_entries, "y" if added_entries == 1 else "ies"))
+    if prompt_changed:
+        words = len(fresh.initial_prompt.split())
+        _out("  initial_prompt : now %d word%s" % (words, "" if words == 1 else "s"))
+        if words >= _learn.MAX_PROMPT_WORDS:
+            _out("                   (at the %d-word budget; further vocabulary will"
+                 % _learn.MAX_PROMPT_WORDS)
+            _out("                    be skipped until you prune it by hand)")
+    _out("")
+    _out("These take effect the next time you start blurt.")
+    _out("Undo by editing %s -- nothing here is irreversible." % path)
+    return 0
+
+
+def _collect_approvals(
+    report: "_learn.Report", unattended: bool
+) -> Optional[List["_learn.Suggestion"]]:
+    """Return the accepted suggestions, or None if the user cannot be asked.
+
+    ``--yes`` takes the high-confidence set and nothing else. The medium ones are
+    exactly the findings that can be wrong in a way the user would not notice, so
+    "accept everything without looking" is not offered for them at any flag.
+    """
+    if unattended:
+        high = report.high_confidence()
+        _out("")
+        _out("--yes: accepting %d high-confidence suggestion(s)." % len(high))
+        skipped = len(report.suggestions) - len(high)
+        if skipped:
+            _out(
+                "       Skipping %d that need a human -- rerun without --yes to see them."
+                % skipped
+            )
+        return high
+
+    if not sys.stdin.isatty():
+        _err("")
+        _err("blurt: --apply needs a terminal to ask you about each suggestion.")
+        _err("  Non-interactively, use --yes to accept the high-confidence ones:")
+        _err("      blurt learn --apply --yes")
+        return None
+
+    _out("")
+    _out("=" * 60)
+    _out("Reviewing %d suggestion(s)." % len(report.suggestions))
+    _out("  y = accept   n = skip (default)   a = accept all remaining   q = stop")
+    _out("")
+
+    accepted: List["_learn.Suggestion"] = []
+    take_rest = False
+    for index, item in enumerate(report.suggestions, 1):
+        if item.kind == "dictionary":
+            headline = "replace %r with %r everywhere" % (item.key, item.value)
+        else:
+            headline = "add %r to the Whisper vocabulary hint" % (item.value,)
+
+        _out("[%d/%d] %s" % (index, len(report.suggestions), headline))
+        _out("       %s -- %s confidence" % (item.reason, item.confidence))
+
+        if take_rest:
+            _out("       accepted")
+            accepted.append(item)
+            _out("")
+            continue
+
+        answer = _prompt_choice("       accept? [y/N/a/q] ")
+        if answer == "q":
+            _out("")
+            _out("Stopped. Keeping the %d already accepted." % len(accepted))
+            break
+        if answer == "a":
+            take_rest = True
+            accepted.append(item)
+        elif answer == "y":
+            accepted.append(item)
+        _out("")
+
+    return accepted
+
+
+def _prompt_choice(prompt: str) -> str:
+    """Read one lowercase answer. EOF and Ctrl+C both mean "stop", not "yes"."""
+    try:
+        raw = input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        _out("")
+        return "q"
+    answer = (raw or "").strip().lower()
+    if answer in ("y", "yes"):
+        return "y"
+    if answer in ("a", "all"):
+        return "a"
+    if answer in ("q", "quit"):
+        return "q"
+    return "n"
+
+
 # -- run --------------------------------------------------------------------
 
 
@@ -927,6 +1329,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _cmd_bench(cfg, args)
     if command == "config":
         return _cmd_config(cfg, args)
+    if command == "learn":
+        return _cmd_learn(cfg, args)
     return _cmd_run(cfg, args)
 
 

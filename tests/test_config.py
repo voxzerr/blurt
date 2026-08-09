@@ -674,6 +674,8 @@ def test_EVERY_field_round_trips_through_save_and_load(tmp_path):
         initial_prompt="OAuth, Kubernetes, voxzerr",
         assistant_enabled=False,
         assistant_hotkey="right_ctrl",
+        history_enabled=True,
+        history_limit=500,
     )
     # Guard against the test itself going stale: if a field is added to Config
     # but not given a non-default value above, this catches it.

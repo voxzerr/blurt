@@ -63,6 +63,7 @@ from .audio import AudioUnavailable, Recorder
 from .cleanup import clean
 from .config import Config, load_config
 from .engines import NoEngineAvailable, select_engine
+from .history import HistoryRecord, append_record
 from .hotkey import HoldToTalk, UnsupportedHotkeyError, accessibility_trusted
 from .inject import copy_to_clipboard, insert_text, secure_input_active
 from .types import ASREngine, Hardware, Transcript
@@ -546,6 +547,7 @@ class BlurtApp:
         )
         with self._history_lock:
             self._history.append(transcript)
+        self._journal(transcript, mode)
 
         self._report_timing(transcript)
 
@@ -559,6 +561,28 @@ class BlurtApp:
             self._handle_command(cleaned)
         else:
             self._deliver(cleaned)
+
+    def _journal(self, transcript: Transcript, mode: str) -> None:
+        """Append this dictation to the on-disk journal, if the user enabled one.
+
+        Opt-in and silent when off -- ``history_enabled`` defaults to False and no
+        file is created until it is set. See :mod:`blurt.history` for why this is
+        the one thing in blurt that writes speech to disk and why the default will
+        not be flipped.
+
+        Never raises and never blocks meaningfully: this runs on the worker thread
+        right after the user's words were delivered, and a journalling failure must
+        not cost them a dictation they already spoke.
+        """
+        if not getattr(self.cfg, "history_enabled", False):
+            return
+        try:
+            append_record(
+                HistoryRecord.from_transcript(transcript, mode),
+                limit=getattr(self.cfg, "history_limit", 2000),
+            )
+        except Exception:  # noqa: BLE001 - append_record already swallows OSError
+            _log.debug("could not journal transcript", exc_info=True)
 
     def _handle_command(self, text: str) -> None:
         """Route a spoken command to an action and run it, announcing the result.

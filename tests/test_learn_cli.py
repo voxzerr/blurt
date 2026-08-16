@@ -18,14 +18,17 @@ to which decision, and a pty would test the terminal rather than the decision.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from blurt.__main__ import main
 from blurt.config import Config, load_config, save_config
 from blurt.history import HistoryRecord, append_record
 from blurt.learn import Suggestion, analyze
+
+# Shared with tests/test_config_cli.py, which asks the same question of the same
+# file. The `home` fixture moved to conftest.py too, and needs no import here:
+# pytest resolves a conftest fixture by name.
+from conftest import config_on_disk
 
 
 # --------------------------------------------------------------------------- #
@@ -57,15 +60,6 @@ _JOURNAL = [
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
-    """An isolated XDG home, so no test can touch the developer's real config."""
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
-    monkeypatch.setenv("HOME", str(tmp_path))
-    return tmp_path
-
-
-@pytest.fixture
 def seeded(home):
     """A journal with findings in it, and journalling switched on."""
     from blurt.history import default_history_path
@@ -85,12 +79,6 @@ def seeded(home):
         )
     save_config(Config(history_enabled=True))
     return default_history_path()
-
-
-def _config_on_disk():
-    from blurt.config import default_config_path
-
-    return json.loads(default_config_path().read_text(encoding="utf-8"))
 
 
 # --------------------------------------------------------------------------- #
@@ -124,9 +112,9 @@ def test_learn_reports_findings(seeded, capsys):
 
 
 def test_learn_without_apply_never_writes(seeded):
-    before = _config_on_disk()
+    before = config_on_disk()
     main(["learn"])
-    assert _config_on_disk() == before
+    assert config_on_disk() == before
 
 
 def test_learn_reports_dictionary_health(home, capsys):
@@ -153,7 +141,7 @@ def test_learn_min_threshold_is_honoured(seeded, capsys):
 
 def test_apply_yes_writes_high_confidence_findings(seeded, capsys):
     assert main(["learn", "--apply", "--yes"]) == 0
-    config = _config_on_disk()
+    config = config_on_disk()
     assert config["dictionary"]["github"] == "GitHub"
     assert "Priya" in config["initial_prompt"]
 
@@ -166,7 +154,7 @@ def test_apply_yes_never_writes_a_medium_finding(seeded):
     assert medium, "this test proves nothing if the journal produced no medium findings"
 
     main(["learn", "--apply", "--yes"])
-    config = _config_on_disk()
+    config = config_on_disk()
 
     for key in medium:
         assert key not in config["dictionary"], (
@@ -183,15 +171,15 @@ def test_apply_yes_says_what_it_skipped(seeded, capsys):
 
 def test_apply_is_idempotent(seeded):
     main(["learn", "--apply", "--yes"])
-    first = _config_on_disk()
+    first = config_on_disk()
     main(["learn", "--apply", "--yes"])
-    assert _config_on_disk() == first
+    assert config_on_disk() == first
 
 
 def test_apply_preserves_unrelated_settings(home, seeded):
     save_config(Config(history_enabled=True, hotkey="right_ctrl", preroll_ms=250))
     main(["learn", "--apply", "--yes"])
-    config = _config_on_disk()
+    config = config_on_disk()
     assert config["hotkey"] == "right_ctrl"
     assert config["preroll_ms"] == 250
 
@@ -199,18 +187,18 @@ def test_apply_preserves_unrelated_settings(home, seeded):
 def test_apply_never_overwrites_an_existing_dictionary_entry(home, seeded):
     save_config(Config(history_enabled=True, dictionary={"github": "GITHUB"}))
     main(["learn", "--apply", "--yes"])
-    assert _config_on_disk()["dictionary"]["github"] == "GITHUB"
+    assert config_on_disk()["dictionary"]["github"] == "GITHUB"
 
 
 def test_a_one_run_override_is_never_persisted(seeded):
     """--cleanup applies to this run only; --apply must not write it to disk."""
     assert main(["--cleanup", "standard", "learn", "--apply", "--yes"]) == 0
-    assert _config_on_disk()["cleanup_level"] == "light"
+    assert config_on_disk()["cleanup_level"] == "light"
 
 
 def test_a_model_override_is_never_persisted(seeded):
     main(["learn", "--apply", "--yes", "--model", "tiny.en"])
-    assert _config_on_disk()["model"] == "auto"
+    assert config_on_disk()["model"] == "auto"
 
 
 def test_apply_with_nothing_to_apply_is_clean(home, capsys):
@@ -235,9 +223,9 @@ def test_apply_without_a_tty_refuses(seeded, monkeypatch, capsys):
 
 def test_apply_without_a_tty_writes_nothing(seeded, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
-    before = _config_on_disk()
+    before = config_on_disk()
     main(["learn", "--apply"])
-    assert _config_on_disk() == before
+    assert config_on_disk() == before
 
 
 # --------------------------------------------------------------------------- #
@@ -363,9 +351,9 @@ def test_forget_with_no_journal_is_not_an_error(home, capsys):
 
 
 def test_forget_leaves_the_config_alone(seeded):
-    before = _config_on_disk()
+    before = config_on_disk()
     main(["learn", "--forget"])
-    assert _config_on_disk() == before
+    assert config_on_disk() == before
 
 
 def test_forget_wins_over_apply(seeded):
@@ -374,4 +362,4 @@ def test_forget_wins_over_apply(seeded):
 
     main(["learn", "--forget", "--apply", "--yes"])
     assert not seeded.exists()
-    assert _config_on_disk()["dictionary"] == {}
+    assert config_on_disk()["dictionary"] == {}

@@ -534,9 +534,12 @@ class Recorder:
             for block in self._chunks:
                 captured += block.shape[0]
             self._preroll_excess = max(0, captured - self._preroll_frames())
+            # Clear the overflow verdict before _recording goes true, and inside
+            # the lock: resetting it after the lock erases an overflow reported by
+            # a callback that had already joined this take, losing a real drop.
+            self._overflowed = False
             self._recording = True
             self._ring.clear()
-        self._overflowed = False
 
     def stop(self) -> "np.ndarray":
         """Stop recording and return mono float32 PCM at the target sample rate.

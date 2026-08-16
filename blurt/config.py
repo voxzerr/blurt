@@ -141,7 +141,34 @@ def _pick_str(
     default: str,
     allowed: Optional[FrozenSet[str]] = None,
 ) -> str:
-    """Read a string field, falling back to ``default`` with a warning."""
+    """Read a string field, falling back to ``default`` with a warning.
+
+    AN EMPTY VALUE IS TWO DIFFERENT SITUATIONS, and only one of them is a
+    problem. For a field whose default is a real value -- ``hotkey``, ``engine``,
+    ``model``, ``cleanup_level``, ``assistant_hotkey`` -- an empty string in the
+    file means the user wrote a key, meant something by it, and is about to get
+    ``right_option`` (or ``auto``, or ``light``) instead. That is worth saying
+    out loud, and it still is: the value they wrote is not the value blurt uses.
+
+    For a field whose default is ITSELF empty -- today only ``initial_prompt``
+    -- there is nothing to say. ``""`` is the documented, shipped default; it is
+    the state every fresh install is in and the state the README, ``learn`` and
+    the demo all leave a new user in. Worse, ``save_config`` serialises the whole
+    dataclass, so ``"initial_prompt": ""`` is written into the file by the act of
+    saving *any* setting -- which meant blurt spent the rest of that user's life
+    complaining, on stderr, on every single command, about a value it had written
+    itself and was not substituting anything for. "Falling back" to a default
+    that is equal to the value we were handed is not a fallback at all: nothing
+    changed, so there is nothing for the reader to fix and nothing for them to
+    do except learn to ignore this stream. A warning that fires in the default
+    state is a warning nobody reads when it finally means something.
+
+    The distinction is drawn on ``default`` rather than on ``key`` on purpose. A
+    hardcoded exemption for ``initial_prompt`` would be wrong the moment somebody
+    adds a second free-text field, and wrong in the silent direction; asking
+    "does this field even have a non-empty default to fall back to" is the actual
+    question, and it answers itself for every field that will ever exist here.
+    """
     if key not in data:
         return default
     value = data[key]
@@ -150,7 +177,8 @@ def _pick_str(
         return default
     value = value.strip()
     if not value:
-        _warn("%s is empty; using %r" % (key, default))
+        if default:
+            _warn("%s is empty; using %r" % (key, default))
         return default
     if allowed is not None and value not in allowed:
         _warn(

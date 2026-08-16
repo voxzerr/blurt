@@ -1,0 +1,286 @@
+# CI for blurt.
+#
+# blurt is a macOS-only application, but its test suite is deliberately not.
+# The suite is hardware-free -- no microphone, no model download, no network, no
+# Accessibility or Microphone permission prompts -- which is what makes it
+# runnable on a Linux runner at all. Keep it that way: a test that needs a real
+# device belongs behind a skip, not in the default run.
+#
+# WHY THERE IS NO `pip install -e .` ANYWHERE IN THIS FILE
+#
+# Two independent reasons, either one of which would be sufficient:
+#
+#   1. It cannot work on Linux. The runtime dependencies in pyproject.toml are
+#      pynput, sounddevice and the pyobjc-framework-* family. The pyobjc wheels
+#      are macOS-only and have no Linux build at all, so resolution fails
+#      outright on ubuntu-latest. There is no "just install it anyway" here.
+#   2. Even where it can work, it is enormous for no benefit. faster-whisper is
+#      a BASE dependency -- it moved out of the `whisper` extra, because it is
+#      the only ASR engine that works and an install without it produced an app
+#      that started and then died with NoEngineAvailable. So there is no longer
+#      an optional piece to decline: ANY `pip install -e .` drags in
+#      faster-whisper, CTranslate2 and a PyTorch-sized pile of shared objects,
+#      on every leg of the matrix. Not one line of it is imported by the tests.
+#      (`pip install -e ".[whisper]"` is not a smaller spelling to reach for
+#      instead: that extra is deliberately kept and deliberately empty, so it
+#      installs precisely the same set.)
+#
+# We do not need the install, because tests/conftest.py prepends the repository
+# root to sys.path. `import blurt` therefore resolves straight from the checkout.
+# That is not a CI convenience hack -- it mirrors how blurt actually runs on the
+# target machine, where there is no Homebrew, no virtualenv and no `pip install`
+# of the project itself.
+#
+# So the only things we install are pytest and numpy. numpy is not optional and
+# not a convenience: blurt/audio.py imports it at module scope, blurt/app.py
+# imports blurt.audio, and tests/test_audio_gain.py imports it directly -- most
+# of the suite would fail at COLLECTION without it. Nothing else in blurt's
+# dependency list is needed, and that is a property of the source rather than
+# luck: blurt/hotkey.py reaches for pynput and blurt/inject.py reaches for
+# AppKit/Quartz inside the functions that use them, never at module scope, so
+# `import blurt.app` succeeds on a machine that has neither.
+#
+# If a future change makes the suite require an installed package, fix the
+# import path or the test, do NOT add an install step here. Adding one will fail
+# on Linux and quietly cost several minutes per job on macOS.
+#
+# WHY PYTHON 3.9 IS A HARD FLOOR AND NOT A NICETY
+#
+# The primary target is a 2017 Intel Mac running Apple's system interpreter at
+# /usr/bin/python3, which is Python 3.9.6. blurt is expected to run there with
+# nothing installed but its own dependencies -- no pyenv, no Homebrew Python.
+# So 3.9 is not the oldest version we grudgingly tolerate; it is the version the
+# main user is actually on. Syntax that parses fine on the developer's 3.12 and
+# raises SyntaxError on 3.9.6 does not degrade, it fails at import, which means
+# the app does not start at all. Every module therefore carries
+# `from __future__ import annotations` and uses typing.Optional/List/Dict forms.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Pushing twice in quick succession should not leave a stale run burning minutes
+# and reporting a result for a commit nobody is looking at any more. Keyed on the
+# ref, so main and each PR branch cancel only themselves.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+
+    strategy:
+      # A failure on 3.9 and a failure on 3.13 usually have different causes and
+      # you want to see both in one run. Cancelling the siblings on first red
+      # hides exactly the information that makes the failure diagnosable.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Every version is QUOTED. Unquoted, YAML reads 3.10 as the float 3.1,
+        # which setup-python then tries to install as Python 3.1. Quoting also
+        # keeps these values the same type as the strings in `exclude:` below --
+        # a string/float mismatch there silently matches nothing, and the
+        # exclusions become no-ops rather than an error.
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        exclude:
+          # macos-latest is arm64, and python-build-standalone publishes no
+          # arm64 macOS build of 3.9 -- setup-python fails with "version not
+          # found" rather than falling back. 3.9 coverage comes from the ubuntu
+          # legs; what the macOS legs are actually for is catching platform
+          # assumptions (path handling, sysctl probing, case-insensitive FS), and
+          # one modern plus one mid-range version is enough for that.
+          #
+          # This block must remove exactly 3 of the 10 combinations, leaving 7:
+          # ubuntu on 3.9/3.10/3.11/3.12/3.13, macos on 3.11/3.13. If a rename
+          # ever makes these keys stop matching, the symptom is 10 jobs (with
+          # three macOS legs failing to install Python), never 0 jobs.
+          - os: macos-latest
+            python-version: "3.9"
+          - os: macos-latest
+            python-version: "3.10"
+          - os: macos-latest
+            python-version: "3.12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No pip caching on purpose. The install is two small pure-wheel packages;
+      # restoring and saving a cache costs more wall time than it saves, and adds
+      # a failure mode (stale or corrupt cache) to a job whose entire job is to
+      # be trustworthy. For the same reason there is no `pip install --upgrade
+      # pip` line: setup-python already ships a current pip, and self-upgrading
+      # the tool you are about to depend on is a way to fail before doing any
+      # work. numpy is unpinned deliberately -- pip resolves the newest wheel
+      # each interpreter supports, which is how 3.9 gets a 2.0.x wheel while 3.13
+      # gets a current one, with no version table here to drift out of date.
+      - name: Install test-only dependencies
+        run: |
+          python -VV
+          python -m pip install pytest numpy
+
+      # Run from the repository root: pyproject.toml sets testpaths = ["tests"],
+      # and tests/conftest.py derives the sys.path entry from its own location.
+      - name: Run test suite
+        run: python -m pytest -q
+
+  # A cheap pre-flight that guards the 3.9 floor without waiting on a 3.9
+  # interpreter. It is intentionally NOT a dependency of `test`: when both are
+  # red you want the real test failures visible in the same run, not skipped
+  # behind a style gate.
+  compat:
+    name: 3.9 floor guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Note what this does and does not prove. Compiling on 3.13 accepts a
+      # superset of 3.9 syntax, so a clean compileall means "no syntax errors at
+      # all"; it cannot by itself catch 3.10+ syntax. It is here to fail fast and
+      # loudly on a genuinely broken file. The 3.9-specific proof is the grep
+      # below plus, authoritatively, the ubuntu/3.9 leg of the `test` matrix.
+      - name: Byte-compile every module
+        run: python -m compileall -q blurt tests
+
+      - name: Require `from __future__ import annotations` in every blurt module
+        # Lazy annotations are what let the whole codebase write Optional[...] and
+        # still annotate freely without paying runtime evaluation costs on 3.9. A
+        # module that forgets the import is the usual way a 3.9 break sneaks in,
+        # because it keeps working on the developer's newer interpreter.
+        #
+        # grep -L reports files that do NOT contain the pattern, and -- unlike
+        # every other grep mode -- it exits 0 whether or not that list is empty.
+        # Its status is therefore worthless here; the emptiness of the OUTPUT is
+        # the signal. Verified against this checkout: 23 files, none missing.
+        run: |
+          set -eo pipefail
+
+          count="$(find blurt -name '*.py' -type f | wc -l)"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::Found no .py files under blurt/ -- the checkout or this path is wrong."
+            exit 1
+          fi
+          echo "Scanning $count Python files under blurt/."
+
+          missing="$(grep -rL --include='*.py' '^from __future__ import annotations$' blurt || true)"
+          if [ -n "$missing" ]; then
+            echo "::error::These modules are missing 'from __future__ import annotations':"
+            echo "$missing"
+            exit 1
+          fi
+          echo "All modules carry the future import."
+
+      - name: Reject syntax that breaks on Python 3.9
+        # The rules below hunt RUNTIME evaluation, which is the part 3.9 actually
+        # chokes on. Because of the future import, `def f(x: Dict[str, int])` and
+        # friends are never evaluated, so annotation position is mostly safe and
+        # is mostly left alone. What is not safe is a union or a builtin generic
+        # that the interpreter has to build an object for while importing.
+        #
+        # These patterns are deliberately CONSERVATIVE -- narrow enough to stay
+        # silent on the existing tree, which is full of legitimate pipes. Real
+        # examples that must not trip them, all present today:
+        #   blurt/cleanup.py     _CLAUSE_BOUNDARY_CHARS = _TERMINAL_CHARS | _COMMA_LIKE
+        #   blurt/history.py     os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        #   blurt/config.py      # "auto" | "faster-whisper" | "apple-speech"
+        #   blurt/assistant/     dozens of regex alternations, r"(?:a|b|c)"
+        #   calendar_backend.py  a docstring that literally says ``list[...]``
+        # A blanket search for "|" or for "list[" flags all of these, which is
+        # why each rule is anchored to a context a bitwise or cannot appear in.
+        #
+        # The trade is accepted in the direction of silence: this will miss an
+        # exotic construction (say `Number = SomeClass | OtherClass`) rather than
+        # cry wolf on prose. The ubuntu/3.9 matrix leg is the real backstop --
+        # this step exists to name the problem in one line instead of making
+        # someone read a SyntaxError traceback.
+        run: |
+          set -eo pipefail
+
+          fail=0
+
+          # grep exits 0 = found, 1 = not found, 2+ = something went wrong. Only
+          # 0 is a violation, and 2 must abort: a check that reports "clean"
+          # because it could not read the tree is worse than no check at all.
+          ban() {
+            local why="$1" pattern="$2" hits status
+            set +e
+            hits="$(grep -rEn --include='*.py' -- "$pattern" blurt)"
+            status=$?
+            set -e
+            if [ "$status" -gt 1 ]; then
+              echo "::error::grep failed with status $status while checking: $why"
+              exit 2
+            fi
+            if [ "$status" -eq 0 ]; then
+              echo "::error::$why"
+              echo "$hits"
+              fail=1
+            fi
+          }
+
+          # Calls that evaluate their arguments immediately. `cast(int | None, x)`
+          # raises TypeError on 3.9 at import time; the future import cannot help,
+          # because this is an expression, not an annotation.
+          ban "PEP 604 union inside a call that evaluates it at runtime -- use typing.Optional/Union" \
+              '\b(cast|isinstance|issubclass|get_type_hints|get_args|get_origin|TypeVar|NewType)\([^)]*\|'
+
+          # `X | None` and `None | X` cannot be a bitwise or under any reading --
+          # NoneType implements no __or__ -- so this needs no context anchor and
+          # is the highest-signal rule here. It also fires in annotation position,
+          # where 3.9 survives only until something calls typing.get_type_hints()
+          # on the module and evaluates the string. Not worth the ambiguity.
+          ban "PEP 604 union with None -- use typing.Optional[X]" \
+              '(\|[[:space:]]*None\b|\bNone[[:space:]]*\|)'
+
+          # A module-level alias is evaluated on import. Anchored to a builtin
+          # type name on the left of the pipe so that set unions and or-ed flag
+          # constants, which look identical in shape, are not caught.
+          ban "type alias built from a PEP 604 union -- use typing.Union[X, Y]" \
+              '^[A-Za-z_][A-Za-z0-9_]*([[:space:]]*:[[:space:]]*TypeAlias)?[[:space:]]*=[[:space:]]*(int|str|float|bool|bytes|bytearray|complex|list|dict|set|frozenset|tuple|type|None|Any)[[:space:]]*\|'
+
+          # Builtin generics (PEP 585) are only subscriptable from 3.9 in
+          # annotations; `dict[str, int]` as a value is a TypeError on 3.8 and a
+          # live object build on 3.9+. Requiring `=`, `(`, `,` or `[` immediately
+          # before the name restricts this to value position -- it deliberately
+          # does not match `x: dict[str, int]` or `-> list[str]:`, and it does not
+          # match the same text inside a docstring sentence.
+          ban "builtin generic subscripted in a value position -- use typing.Dict/List/Tuple" \
+              '(=|\(|,|\[)[[:space:]]*\b(list|dict|set|frozenset|tuple|type)\['
+
+          # Structural pattern matching is 3.10+, and it is a SyntaxError on 3.9
+          # -- the module will not import at all. Restricting the subject to a
+          # single whitespace-free token keeps prose like "match the following:"
+          # out of the results while still catching `match cmd:` and `case _:`.
+          ban "match/case statement -- 3.10+ syntax, SyntaxError on 3.9" \
+              '^[[:space:]]*(match|case)[[:space:]]+[^[:space:]]+[[:space:]]*:[[:space:]]*$'
+
+          # The same thing over a tuple/list/dict subject, e.g. `match (a, b):`,
+          # which the whitespace-free rule above cannot see.
+          ban "match statement over a sequence subject -- 3.10+ syntax, SyntaxError on 3.9" \
+              '^[[:space:]]*match[[:space:]]*[([{].*:[[:space:]]*$'
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Python 3.9 floor violated. The target machine runs Apple's system python3 (3.9.6)."
+            exit 1
+          fi
+          echo "No 3.9-incompatible runtime syntax found."

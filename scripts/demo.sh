@@ -262,12 +262,12 @@ say ""
 note "'get' prints the value alone, unlabelled and unquoted, so a script can"
 note "capture it. That 'true' came back off disk: the setting stuck."
 say ""
-note "The \"initial_prompt is empty\" line above is stderr, and it is a real"
-note "cosmetic wart rather than a problem with your config: config.json now"
-note "exists and stores initial_prompt as \"\", which is also its default, and"
-note "the loader announces the fallback instead of staying quiet about a value"
-note "that did not actually change. It goes away in section 5, the moment the"
-note "prompt is non-empty. This demo does not hide stderr, so you get to see it."
+note "Note what did NOT appear: nothing on stderr. Writing the config stores"
+note "initial_prompt as \"\", which is also its default, and an earlier build"
+note "announced that fallback as a warning on every single command -- starting"
+note "with the one the README tells you to run first. An empty initial_prompt"
+note "is the documented default state, not a misconfiguration, so it is now"
+note "silent. This demo does not hide stderr, so you would see it if it came back."
 
 pause
 

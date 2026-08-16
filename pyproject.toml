@@ -27,6 +27,20 @@ dependencies = [
     # degrades gracefully if this is missing, but it is on by default, so it
     # belongs in the base install.
     "pyobjc-framework-EventKit",
+    # NOT optional, despite having lived under a `whisper` extra for a long
+    # time. That extra was a lie: faster-whisper is the only ASR engine that
+    # works. The Apple Speech backend is a deliberate rejection stub that always
+    # reports itself unavailable (see blurt/engines/apple_speech_engine.py for
+    # the three independent reasons), so with faster-whisper absent there is no
+    # second engine to fall back to -- `pip install blurt` produced an app that
+    # started, probed the hardware, and then died with NoEngineAvailable. The
+    # error message explains the fix, but a guaranteed first-run failure for
+    # anyone who runs the obvious install command is not a thing to ship.
+    #
+    # Floor is >=1.2 because that is the first release verified to import and
+    # transcribe on the Intel floor machine; earlier releases are not trusted
+    # there and this project's whole compatibility story is that machine.
+    "faster-whisper>=1.2",
 ]
 
 classifiers = [
@@ -49,9 +63,15 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# The engine you actually want. Pinned at >=1.2 because that is the first
-# release verified to import and transcribe on the Intel floor machine.
-whisper = ["faster-whisper>=1.2"]
+# Deliberately empty, deliberately still here. faster-whisper moved into the
+# base dependencies (see the note there), so this extra has nothing left to
+# install -- but the README, the troubleshooting table and every set of notes a
+# user has written down still say `pip install -e ".[whisper]"`. pip treats an
+# unknown extra as a warning today and a hard error tomorrow, and either way it
+# is a confusing failure for someone following instructions that used to be
+# correct. Keeping the key defined makes that command a harmless no-op forever.
+# Do not delete it, even though it looks like dead weight.
+whisper = []
 
 # Apple's on-device Speech framework as a fallback engine.
 speech = ["pyobjc-framework-Speech"]

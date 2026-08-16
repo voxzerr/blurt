@@ -2,11 +2,17 @@
 
 Subcommands::
 
-    blurt            run the dictation daemon (the default)
-    blurt doctor     diagnose this machine -- run this first when something is wrong
-    blurt bench      measure real transcription latency HERE, not in a datasheet
-    blurt config     print the resolved configuration and where it came from
-    blurt learn      review your transcript journal and personalize from it
+    blurt                       run the dictation daemon (the default)
+    blurt doctor                diagnose this machine -- run this first when
+                                something is wrong
+    blurt bench                 measure real transcription latency HERE, not in
+                                a datasheet
+    blurt config                print the resolved configuration and where it
+                                came from
+    blurt config get KEY        print one setting's value, raw, for scripting
+    blurt config set KEY VALUE  change one setting and save it
+    blurt learn                 review your transcript journal and personalize
+                                from it
 
 ``doctor`` is the important one. blurt's failure modes on macOS are almost all
 permission or environment problems that produce silence rather than errors: a
@@ -18,10 +24,34 @@ read. ``doctor`` exists to turn all of that into text.
 enormous -- tiny.en takes ~2s on a 2017 Intel i7 and a fraction of that on an
 M-series -- so quoting anyone else's figures would be dishonest.
 
+``config set`` exists because for a long time it did not, and the whole learning
+loop was the casualty. ``history_enabled`` defaults to false, so the journal that
+``learn`` reads only starts filling once the user turns it on -- and the only way
+to turn it on was to hand-author JSON at a path that does not exist yet on a
+fresh install. Asking someone to create ``~/.config/blurt/config.json`` from
+memory, correctly, before they can try a feature is the same as not shipping the
+feature. ``set`` is deliberately narrow: one scalar setting at a time, validated
+against exactly the rules ``load_config`` enforces, and it never writes anything
+it could not read back.
+
 ``learn`` reads the opt-in transcript journal (``history_enabled``) and proposes
 ``dictionary`` and ``initial_prompt`` entries from it. It proposes; it does not
 decide. ``--apply`` walks the suggestions one at a time, ``--yes`` accepts the
 high-confidence ones unattended, and ``--forget`` deletes the journal outright.
+
+Two commands here write to disk -- ``learn --apply`` and ``config set`` -- and
+neither of them persists the in-memory config that ``main`` built. That one has
+the one-run override flags folded into it, and saving it would silently promote a
+temporary ``--cleanup standard`` into a permanent setting.
+
+Both go further than that and never build a ``Config`` for the user's file at
+all. They read the config as the raw JSON object it is on disk, change only the
+keys they were actually asked to change, and write that object back, so keys this
+version of blurt does not recognise and values its loader would have replaced are
+both left exactly where the user put them. ``set`` changes one key;
+``learn --apply`` changes ``dictionary`` and ``initial_prompt`` and nothing else.
+See ``_read_config_document`` for what the alternative destroys, and
+``_merge_into_config_file`` for the write.
 
 What can go wrong on macOS:
   - ``doctor`` briefly opens the microphone (about half a second) to check
@@ -45,7 +75,7 @@ import pathlib
 import platform
 import sys
 import time
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
 from . import engines as _engines
@@ -139,7 +169,15 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="blurt",
         parents=[common],
         description="Hold a key, talk, and have your words typed where the cursor is.",
-        epilog="Run 'blurt doctor' first if anything is not working.",
+        epilog=(
+            "Run 'blurt doctor' first if anything is not working.\n"
+            "\n"
+            "Settings live in a JSON file, but you never have to write it by hand:\n"
+            "  blurt config                            show everything, and its path\n"
+            "  blurt config get history_enabled        print one value, raw\n"
+            "  blurt config set history_enabled true   turn on the journal 'learn' reads\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--version", action="version", version="blurt " + __version__
@@ -193,11 +231,78 @@ def _build_parser() -> argparse.ArgumentParser:
         help="skip the microphone and use synthetic audio (measures compute only)",
     )
 
-    sub.add_parser(
+    # `config` gained subcommands rather than flags (`--get`, `--set`) so that the
+    # bare, read-only invocation stays exactly what it always was. Someone typing
+    # `blurt config` to look at their settings must never discover that they have
+    # changed something.
+    config = sub.add_parser(
         "config",
         parents=[common],
-        help="print the resolved configuration and its file path",
-        description="Show the effective settings and where they were read from.",
+        help="show, read or change the configuration",
+        # Wrapped by hand: RawDescriptionHelpFormatter is here to keep the
+        # example block in the epilog aligned, and it does not re-wrap the
+        # description either.
+        description=(
+            "With no action, print the effective settings and where they were\n"
+            "read from -- read-only, as it has always been. 'get' prints a single\n"
+            "value for scripting. 'set' is the supported way to change a setting\n"
+            "without hand-editing JSON."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  blurt config                            show everything\n"
+            "  blurt config get history_enabled        print one value, raw\n"
+            "  blurt config set history_enabled true   turn on the transcript journal\n"
+            "  blurt config set cleanup_level standard\n"
+            "\n"
+            "The 'dictionary' setting holds many entries and cannot be set this\n"
+            "way; 'blurt learn --apply' builds it from your own transcripts.\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    config_actions = config.add_subparsers(dest="config_action", metavar="ACTION")
+
+    config_get = config_actions.add_parser(
+        "get",
+        parents=[common],
+        help="print one setting's value, raw, on a single line",
+        description=(
+            "Print the resolved value of one setting and nothing else -- no "
+            "label, no quotes, no trailing commentary -- so it can be piped or "
+            "captured in a shell variable. Booleans print as true/false, which "
+            "is what 'set' accepts back."
+        ),
+    )
+    config_get.add_argument(
+        "key",
+        metavar="KEY",
+        help="setting name; 'blurt config' lists them all with their values",
+    )
+
+    config_set = config_actions.add_parser(
+        "set",
+        parents=[common],
+        help="change one setting and write it to the config file",
+        description=(
+            "Validate a value, merge it into the config file, and say what "
+            "changed. Only the named setting is touched -- everything else in "
+            "the file is left exactly as written, including settings this "
+            "version of blurt does not recognise. A rejected value writes "
+            "nothing at all. Settings take effect the next time blurt starts."
+        ),
+    )
+    config_set.add_argument(
+        "key",
+        metavar="KEY",
+        help="setting name; 'blurt config' lists them all",
+    )
+    config_set.add_argument(
+        "value",
+        metavar="VALUE",
+        help=(
+            "true/false for a switch (yes/no/on/off/1/0 also work), a whole "
+            "number for a count, otherwise the literal text"
+        ),
     )
 
     learn = sub.add_parser(
@@ -935,7 +1040,649 @@ def _synth_sample(np: Any, sample_rate: int, seconds: float) -> Any:
 # -- config -----------------------------------------------------------------
 
 
+#: Accepted spellings for a boolean setting. Generous on input and strict on
+#: output: whatever the user types, the file always ends up holding a real JSON
+#: ``true``/``false``, because a quoted "true" is the one thing ``load_config``
+#: will refuse and fall back to the default for.
+#:
+#: Tuples rather than sets so the help text can print them in the order a person
+#: would say them. Four entries each; membership testing is not the bottleneck.
+_TRUE_WORDS: Tuple[str, ...] = ("true", "yes", "on", "1")
+_FALSE_WORDS: Tuple[str, ...] = ("false", "no", "off", "0")
+
+#: Returned by the parsing helpers instead of raising, and deliberately not
+#: ``None``: ``False``, ``0`` and ``""`` are all legitimate settings, so any
+#: falsy sentinel would make "rejected" indistinguishable from "set to off".
+_REJECTED: Any = object()
+
+
+def _config_fields() -> Dict[str, "dataclasses.Field"]:
+    """Map setting name -> dataclass field, read straight off :class:`Config`.
+
+    Derived rather than written out by hand, and that is not fastidiousness. A
+    hardcoded list of settable keys is wrong the moment somebody adds a field to
+    ``Config`` without knowing this file exists, and the failure is quiet: the new
+    setting simply cannot be reached from the CLI, ``blurt config get`` calls it
+    unknown, and nothing anywhere says why. Reading the dataclass means a new
+    field is settable the day it lands.
+    """
+    return dict((f.name, f) for f in dataclasses.fields(Config))
+
+
+def _declared_type(field: "dataclasses.Field") -> Any:
+    """Resolve a field's declared annotation to a real type, or None.
+
+    ``blurt.config`` uses ``from __future__ import annotations``, so ``field.type``
+    is the *string* ``"bool"`` rather than the class -- comparing it against
+    ``bool`` directly silently fails for every field, and the symptom would be
+    "every setting is unsettable" with no error to read. The ``isinstance(type)``
+    branch keeps this working if that import is ever dropped from config.py.
+
+    Returns None for anything that is not a scalar (today: ``dictionary``, whose
+    annotation is ``Dict[str, str]``). Callers treat None as "cannot come from a
+    single command-line word" rather than guessing.
+    """
+    declared = field.type
+    if isinstance(declared, type):
+        return declared
+    return {"bool": bool, "int": int, "str": str}.get(str(declared).strip())
+
+
+def _format_value(value: Any) -> str:
+    """Render a setting the way the config file spells it.
+
+    ``get`` exists to be piped, and the obvious thing to pipe it into is ``set``,
+    so the two have to agree: booleans print as ``true``/``false`` rather than
+    Python's ``True``, and strings print bare so ``$(blurt config get hotkey)`` is
+    a hotkey name and not a hotkey name wrapped in punctuation. The dictionary
+    prints as one line of JSON -- it cannot be fed back to ``set``, but a value
+    that is read-only should still be readable.
+    """
+    if isinstance(value, bool):  # before int: bool is a subclass of it
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def _unknown_setting(key: str) -> int:
+    """Complain about a key nobody has, and list the ones that exist. Exits 2."""
+    _err("blurt: unknown setting %r." % (key,))
+    _err("  Valid settings: %s" % ", ".join(sorted(_config_fields())))
+    _err("  'blurt config' prints all of them with their current values.")
+    return 2
+
+
+def _parse_string_setting(key: str, raw: str) -> Any:
+    """Validate a string setting using whatever rule already governs it.
+
+    Every check here is borrowed rather than reinvented, because a second copy of
+    a rule is a copy that drifts: ``engine`` and ``cleanup_level`` go against the
+    same frozensets ``load_config`` uses, and both hotkey fields go through
+    ``normalize_key_name`` so the CLI refuses exactly what the input layer
+    refuses. That last one matters more than it looks -- ``fn`` is a perfectly
+    reasonable thing to want as a push-to-talk key and pynput cannot see it on
+    macOS at all, so accepting it here would save a config that produces a
+    daemon which starts cleanly and then never responds to the key.
+
+    Values are stripped because ``load_config`` strips them on the way back in.
+    Storing ``"  right_cmd  "`` would only mean the file disagrees with the
+    setting blurt actually uses.
+    """
+    value = raw.strip()
+
+    if key == "engine":
+        value = value.lower()
+        if value not in VALID_ENGINES:
+            _err(
+                "blurt: engine %r is not valid. Choose one of: %s"
+                % (raw, ", ".join(sorted(VALID_ENGINES)))
+            )
+            return _REJECTED
+        return value
+
+    if key == "cleanup_level":
+        value = value.lower()
+        if value not in VALID_CLEANUP_LEVELS:
+            _err(
+                "blurt: cleanup_level %r is not valid. Choose one of: %s"
+                % (raw, ", ".join(sorted(VALID_CLEANUP_LEVELS)))
+            )
+            return _REJECTED
+        return value
+
+    if key in ("hotkey", "assistant_hotkey"):
+        try:
+            return normalize_key_name(value)
+        except UnsupportedHotkeyError as exc:
+            _err("blurt: %s %r is not usable.\n  %s" % (key, raw, exc))
+            _err("  Supported: %s" % ", ".join(SUPPORTED_HOTKEYS))
+            return _REJECTED
+
+    if key == "model" and not value:
+        # Same rule as --model: an empty model name is always a mistake, and
+        # unlike the sizes it is one we can be certain about. Model names
+        # otherwise go unvalidated because faster-whisper accepts local paths
+        # and Hugging Face ids as well as tiny.en/base.en/small.en, and
+        # rejecting an unfamiliar string would block a legitimate use.
+        _err("blurt: model must not be empty")
+        return _REJECTED
+
+    return value
+
+
+def _parse_setting(key: str, field: "dataclasses.Field", raw: str) -> Any:
+    """Turn one command-line word into a value of the field's declared type.
+
+    Returns :data:`_REJECTED` after printing the reason to stderr; it never
+    raises, and it never guesses. Typed-but-unparseable is treated as a hard
+    error rather than as "use the default", because a user who typed
+    ``history_enabled banana`` has a belief about what is about to happen and
+    quietly writing ``false`` would leave that belief intact and wrong.
+    """
+    kind = _declared_type(field)
+
+    if kind is bool:
+        text = raw.strip().lower()
+        if text in _TRUE_WORDS:
+            return True
+        if text in _FALSE_WORDS:
+            return False
+        _err("blurt: %s is a true/false setting; %r is neither." % (key, raw))
+        _err(
+            "  On: %s.  Off: %s.  Case does not matter."
+            % (" / ".join(_TRUE_WORDS), " / ".join(_FALSE_WORDS))
+        )
+        return _REJECTED
+
+    if kind is int:
+        try:
+            return int(raw.strip(), 10)
+        except ValueError:
+            _err("blurt: %s is a whole number; %r is not one." % (key, raw))
+            return _REJECTED
+
+    if kind is str:
+        return _parse_string_setting(key, raw)
+
+    # Not a scalar. Today that is only `dictionary`, and the temptation is to
+    # invent a syntax for it -- `set dictionary github=GitHub` or similar. That
+    # would be a worse version of a feature that already exists and knows more
+    # than the user does about what belongs in there.
+    _err(
+        "blurt: %s holds a %s, which cannot be set from a single value."
+        % (key, field.type)
+    )
+    if key == "dictionary":
+        _err("  'blurt learn --apply' builds it from your own transcripts, which")
+        _err("  is the only way blurt can know what you actually say.")
+    _err("  To edit it directly: %s" % default_config_path())
+    return _REJECTED
+
+
+def _loader_would_reject(cfg: Config, key: str, value: Any) -> bool:
+    """Ask the loader itself whether this value survives a round trip.
+
+    ``config.py`` owns the numeric ranges -- sample_rate 8000..48000, the
+    millisecond caps, the journal cap -- and keeps them private. Copying them
+    here would put a second statement of the rules in a file with no way to
+    notice when the first one changes, so instead we serialize, read it back, and
+    see what comes out. The bounds stay in exactly one place.
+
+    Worth the round trip because the failure is otherwise invisible: an
+    out-of-range ``sample_rate`` saves without complaint and is then silently
+    replaced by the default on every single launch, behind a stderr warning the
+    user has long since stopped reading. Refusing now costs a second of their
+    time; accepting costs a setting that permanently does not do anything.
+
+    Best effort in one direction only. If the probe cannot run at all -- no
+    writable temp directory -- the answer is "not rejected", because refusing to
+    save a legitimate setting because a scratch file could not be created would
+    be the wrong trade in a helper whose entire job is catching a typo.
+
+    ``cfg`` is a throwaway carrying defaults for everything except ``key`` (see
+    :func:`_cmd_config_set`), not the user's own config. Nothing in
+    ``_from_dict`` validates one field against another -- every setting is picked
+    independently -- so the answer for ``key`` is the same either way, and a
+    defaults-based probe keeps the warnings free of complaints about fields the
+    user is not currently changing.
+
+    THE STDERR CAPTURE THAT USED TO BE HERE IS GONE, and it is worth recording
+    why it was here at all. This ran the probe load with stderr redirected into a
+    buffer and then replayed only the captured lines containing ``key``, because
+    a probe file built from the defaults was not quiet: ``save_config``
+    serialises the whole dataclass, so it writes ``"initial_prompt": ""``, and
+    ``config.py``'s ``_pick_str`` warned about an empty value even for a field
+    whose default was empty too. A perfectly healthy config therefore announced
+    "initial_prompt is empty" on the way in, and printing that above "Wrote your
+    config" read as a failure that had not happened.
+
+    That is now fixed where it belonged, in ``_pick_str``: an empty value only
+    warns when the field has a real default to fall back to. With it fixed the
+    workaround is not merely unnecessary but worse than nothing. A defaults file
+    loads in total silence, so the only warning this probe can now produce is the
+    one about ``key`` -- precisely the line we wanted the user to see -- and
+    letting ``load_config`` print it itself also retires the ``key in line``
+    substring match, which was a sieve waiting to mis-fire the day two settings
+    shared a name fragment. Every path in ``_from_dict`` that warns also returns
+    the default, so "the loader printed something" and "the value did not
+    survive" are the same event; there is no case where suppressing output would
+    still be doing work.
+    """
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            probe = pathlib.Path(tmpdir) / "config.json"
+            save_config(cfg, probe)
+            # Deliberately not captured. On a mismatch load_config states the
+            # actual range, and no message written here could do it as
+            # accurately; on a match it says nothing at all, so a successful
+            # `set` still writes nothing to stderr.
+            return getattr(load_config(probe), key) != value
+    except OSError:
+        return False
+
+
+def _serialised_defaults() -> Dict[str, Any]:
+    """The default config as the JSON object ``save_config`` would have written.
+
+    ``set`` starts from this when there is no file yet. Writing only the one key
+    the user named would load perfectly well -- every absent key falls back to
+    its default -- but it would leave them with a file whose shape depends on
+    which setting they happened to touch first, and nothing to read when they
+    open it wondering what else is in there. A complete file is the friendlier
+    artefact and costs nothing.
+    """
+    return dataclasses.asdict(Config())
+
+
+def _read_config_document(path: pathlib.Path) -> Optional[Dict[str, Any]]:
+    """Read the config file as the plain JSON object it actually is on disk.
+
+    NOT ``load_config``, and the difference is the whole point of this function.
+    ``load_config`` returns a :class:`Config`, and a ``Config`` is a lossy view of
+    the file in two directions that both destroy user data on the way back out:
+
+      * It drops keys it does not recognise. That is deliberate and correct for
+        *reading* -- ``config.py`` calls it forward compatibility, an older blurt
+        quietly tolerating a newer blurt's settings -- but round-tripping through
+        the dataclass turns "tolerated" into "deleted". Run an older blurt once,
+        change one setting, and every setting the newer one wrote is gone, with
+        nothing on screen to say so.
+      * It substitutes the default for any value it rejects. So a typo'd
+        ``sample_rate: 999999`` would be *overwritten with 16000* by the very act
+        of changing an unrelated setting, erasing the evidence the user needs in
+        order to find and fix their typo.
+
+    Both are silent and neither is recoverable, which is why ``set`` merges into
+    the raw dict instead: it changes the one key it was asked to change and
+    leaves every other byte's worth of meaning alone.
+
+    Returns the serialised defaults when there is no file (the normal fresh
+    install), and ``None`` -- after printing why -- when a file exists but cannot
+    be understood. ``None`` deliberately does not mean "start fresh": an
+    unparseable file is still the only copy of whatever the user wrote in it, and
+    silently replacing it with defaults would be the single most destructive
+    thing this command could do. Note that this reads the file directly rather
+    than going anywhere near ``load_config``, which renames a corrupt config to
+    ``.bak`` as a side effect of being asked to read it; refusing means refusing,
+    including refusing to move their file.
+    """
+    try:
+        with open(str(path), "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return _serialised_defaults()
+    except (OSError, UnicodeDecodeError) as exc:
+        _err("blurt: could not read %s (%s)" % (path, exc))
+        _err("  Nothing was written. blurt will not replace a config file it was")
+        _err("  unable to read first -- the bytes in there may still be yours.")
+        return None
+
+    try:
+        data = json.loads(text)
+    except ValueError as exc:  # JSONDecodeError on 3.9; keep it broad
+        _err("blurt: %s is not valid JSON (%s)." % (path, exc))
+        _explain_unusable_config(path)
+        return None
+
+    if not isinstance(data, dict):
+        _err(
+            "blurt: %s must contain a JSON object, got %s."
+            % (path, type(data).__name__)
+        )
+        _explain_unusable_config(path)
+        return None
+
+    return data
+
+
+def _explain_unusable_config(path: pathlib.Path) -> None:
+    """Tell the user how to get out of an unreadable config, and write nothing.
+
+    Split out only so the two shapes of "unusable" -- text that is not JSON at
+    all, and valid JSON that is not an object -- give identical advice, because
+    the way out of both of them is identical.
+    """
+    _err("  Nothing was written. Overwriting it would destroy whatever is in")
+    _err("  there, and a config file can hold a replacement dictionary built from")
+    _err("  months of your own speech that exists nowhere else.")
+    _err("  Fix the JSON, or move the file out of the way and run this again:")
+    _err("      mv %s %s.bak" % (path, path))
+
+
+def _write_config_document(document: Dict[str, Any], path: pathlib.Path) -> None:
+    """Write a raw config object with exactly ``save_config``'s durability.
+
+    This duplicates ``save_config``'s body, and that is the deliberate choice
+    rather than the lazy one. The alternatives were worse:
+
+      * Round-trip the dict through a ``Config`` and call ``save_config``. That
+        is precisely the data loss this whole change exists to remove.
+      * Widen ``save_config`` to accept a raw dict. It lives in ``config.py``,
+        which is owned elsewhere, and giving the module's one durable-write
+        function a second calling convention to serve one CLI subcommand is a
+        cost paid by every future reader of it.
+      * Write the file with ``open(path, "w")``. Absolutely not. That truncates
+        the user's real config *first* and then writes; a crash, a full disk or a
+        SIGKILL in between leaves them with a half-written or empty config where
+        a good one used to be. The whole reason ``save_config`` builds a temp file
+        and calls ``os.replace`` is that ``os.replace`` is atomic -- the config is
+        the old one or the new one, never a fragment of either.
+
+    So: same temp-file-in-the-destination-directory (``os.replace`` is only
+    atomic within one filesystem), same fsync before the rename, same 0600 before
+    it is reachable by name, same best-effort directory fsync after. Same
+    ``json.dumps`` arguments too, so a ``set`` that changes nothing produces a
+    byte-identical file. Raises ``OSError``, like ``save_config``; the caller
+    reports it.
+    """
+    import tempfile
+
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+
+    payload = json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(directory), prefix="." + path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # chmod before the rename: the file must never be readable at its real
+        # name with the wrong mode, not even for an instant.
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    try:
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def _merge_into_config_file(
+    document: Dict[str, Any], changes: Dict[str, Any], path: pathlib.Path
+) -> bool:
+    """Set exactly ``changes`` in an already-read document and save it. True on success.
+
+    The back half of the read-modify-write that both writing commands share;
+    :func:`_read_config_document` is the front half. Factored out rather than
+    written twice because the halves only mean anything as a pair: reading the
+    raw JSON is what preserves the keys and values a ``Config`` would have
+    dropped, and that preservation is undone the instant somebody writes the file
+    back from anything other than the object they read. ``learn --apply`` was the
+    proof -- ``config set`` was carefully merging while ``learn --apply``, four
+    hundred lines away, still did ``load_config()`` then ``save_config()`` and
+    deleted the same unknown keys the other command was protecting.
+
+    ``changes`` is the whole point of the signature. Callers pass only the keys
+    they actually decided to change, so a key nobody touched is not rewritten
+    even to an identical value -- which matters for a key whose current contents
+    the loader would not accept, since re-deriving it is the step that would
+    quietly replace it.
+
+    Nothing is validated here. Both callers validate before they get this far,
+    each against the rules that apply to what they are writing, and a second
+    opinion at the write barrier would only be a third statement of rules that
+    already live in two places.
+    """
+    document.update(changes)
+    try:
+        _write_config_document(document, path)
+    except OSError as exc:
+        _err("blurt: could not write %s (%s)" % (path, exc))
+        _err("  Nothing was changed. Check that %s is writable, or point" % path.parent)
+        _err("  XDG_CONFIG_HOME somewhere that is.")
+        return False
+    return True
+
+
+#: The two settings that name a physical key. Held together because the only
+#: interesting rule about either is the one that relates them to each other.
+_HOTKEY_FIELDS: Tuple[str, str] = ("hotkey", "assistant_hotkey")
+
+
+def _canonical_hotkey(name: str) -> str:
+    """Fold a hotkey spelling for comparison, tolerating ones blurt cannot use.
+
+    ``normalize_key_name`` is the authority, but it raises for anything
+    unsupported and a *comparison* must not. A config that already says
+    ``hotkey: "fn"`` is broken in its own separate way; that is not this check's
+    business, and it still has to be able to answer "is this the same key as the
+    one being set" without exploding. Falling back to the stripped, lowercased
+    text answers that correctly: two identical unusable spellings compare equal,
+    and an unusable one never compares equal to a canonical one.
+    """
+    try:
+        return normalize_key_name(name)
+    except UnsupportedHotkeyError:
+        return name.strip().lower()
+
+
+def _effective_hotkey(document: Dict[str, Any], key: str) -> str:
+    """What blurt would really use for one hotkey field, given the file as it is.
+
+    Mirrors ``_pick_str``: a present, non-empty string is taken as written and
+    anything else (missing, null, a number, blank) falls back to the field's
+    default. Asking the raw document rather than a loaded ``Config`` keeps this
+    honest about a file that has not been through the loader yet -- which is the
+    only kind of file ``set`` ever sees now.
+    """
+    raw = document.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        return getattr(Config(), key)
+    return raw.strip()
+
+
+def _hotkey_would_collide(document: Dict[str, Any], key: str, value: str) -> bool:
+    """Refuse a hotkey that would leave both keys pointing at the same physical key.
+
+    THE FAILURE THIS PREVENTS. Validated in isolation, ``assistant_hotkey
+    right_option`` is a perfectly good value, and so is ``hotkey right_option``.
+    Together they are not. ``BlurtApp._build_assistant`` resolves the tie by
+    switching assistant mode off entirely -- one key cannot mean two things, and
+    silently guessing which the user meant would be worse -- so a single
+    valid-looking command turns off command mode without ever saying it did. The
+    user then has no hotkey for the assistant AND, since command mode is where
+    ``revert_last`` lives, no way to speak an undo either. Two features gone, no
+    error, and the config file looks entirely reasonable.
+
+    THE RULE IS THE RUNTIME'S RULE. ``_build_assistant`` compares
+    ``assistant_hotkey`` against ``hotkey`` and disables the assistant when they
+    are equal. This asks the same question, with one deliberate strengthening:
+    both sides are folded through :func:`_canonical_hotkey` first. The runtime
+    compares the strings as loaded, so ``right_alt`` and ``right_option`` -- the
+    same key, two accepted spellings -- slip past it and produce something worse
+    than the case it does catch: two hotkey listeners bound to one physical key,
+    with no warning at all. Refusing here covers both, and cannot drift from the
+    runtime in the direction that matters, because everything the runtime rejects
+    this rejects too.
+
+    Not conditioned on ``assistant_enabled``, though ``_build_assistant`` checks
+    it first. A collision that is currently harmless because the assistant is off
+    is a trap armed for whenever somebody runs ``config set assistant_enabled
+    true``, and at that point the message would be attached to the wrong command
+    entirely. Refusing now costs one retry with a different key; the alternative
+    costs a feature that quietly does not exist.
+
+    Prints and returns True on a conflict, in the style of
+    :func:`_loader_would_reject`. Nothing is written by the caller either way.
+    """
+    other = "assistant_hotkey" if key == "hotkey" else "hotkey"
+    other_value = _effective_hotkey(document, other)
+    if _canonical_hotkey(value) != _canonical_hotkey(other_value):
+        return False
+
+    current = _effective_hotkey(document, key)
+    _err(
+        "blurt: %s %s would collide with %s; nothing was written."
+        % (key, _format_value(value), other)
+    )
+    _err("  %-16s : %s" % (other, other_value))
+    _err("  %-16s : %s  (you asked for %s)" % (key, current, _format_value(value)))
+    _err("  One key cannot mean two things. With both set the same, blurt turns")
+    _err("  assistant mode off at startup -- so this command would have disabled")
+    _err("  command mode, and command mode is how you would speak the undo.")
+    _err("  Give them different keys, or change %s first:" % other)
+    _err("      blurt config set %s KEY" % other)
+    _err("  Supported: %s" % ", ".join(SUPPORTED_HOTKEYS))
+    return True
+
+
 def _cmd_config(cfg: Config, args: argparse.Namespace) -> int:
+    """Dispatch the three shapes of ``blurt config``.
+
+    The bare form is unchanged and stays read-only. ``get`` and ``set`` are
+    subcommands rather than flags so that adding them could not possibly alter
+    what the bare form does.
+    """
+    action = getattr(args, "config_action", None)
+    if action == "get":
+        return _cmd_config_get(cfg, args)
+    if action == "set":
+        return _cmd_config_set(args)
+    return _cmd_config_show(cfg, args)
+
+
+def _cmd_config_get(cfg: Config, args: argparse.Namespace) -> int:
+    """Print one setting and nothing else, for scripts.
+
+    Reads the *resolved* config -- the one with any ``--model`` / ``--cleanup``
+    overrides folded in -- so that ``blurt --model tiny.en config get model``
+    answers the question actually asked: what would this run use. The file is
+    untouched either way; only ``set`` reads it back off disk.
+    """
+    key = getattr(args, "key", "") or ""
+    if key not in _config_fields():
+        return _unknown_setting(key)
+    _out(_format_value(getattr(cfg, key)))
+    return 0
+
+
+def _cmd_config_set(args: argparse.Namespace) -> int:
+    """Validate one setting, merge it into the file on disk, and report the change.
+
+    A MERGE, NOT A ROUND TRIP. This edits the raw JSON object in the config file
+    and changes exactly one key in it. It used to load a ``Config`` and write the
+    whole dataclass back, which quietly deleted every key the current version does
+    not recognise and quietly overwrote every value the loader had rejected --
+    see :func:`_read_config_document` for why both of those are unrecoverable.
+    The user asked to change one setting; one setting is what changes.
+
+    Deliberately ignores the config ``main`` resolved. That one has any
+    ``--model`` / ``--cleanup`` / ``--engine`` / ``--hotkey`` overrides folded
+    into it, and those are for one run by construction; writing them back would
+    turn a flag someone passed to try something into a permanent setting they
+    never chose and would have no reason to look for. ``_learn_apply`` avoids the
+    same trap the same way -- it reads the file rather than the resolved config --
+    and both are covered by tests that pass an override and assert it never lands.
+
+    Validation still happens against the typed field, and against the loader's own
+    range rules, before anything is written -- the file is only merged into once
+    every check has passed. So a rejected value leaves it exactly as it was,
+    including "not existing at all", which is the normal state on a fresh install.
+    """
+    key = getattr(args, "key", "") or ""
+    raw = getattr(args, "value", None)
+    if raw is None:
+        raw = ""
+
+    fields = _config_fields()
+    if key not in fields:
+        return _unknown_setting(key)
+
+    value = _parse_setting(key, fields[key], raw)
+    if value is _REJECTED:
+        return 2
+
+    path = default_config_path()
+    document = _read_config_document(path)
+    if document is None:
+        # The file exists and could not be understood. _read_config_document has
+        # already said so and said what to do about it; the only thing left that
+        # could make this worse is writing.
+        return 1
+
+    if key in _HOTKEY_FIELDS and _hotkey_would_collide(document, key, value):
+        return 2
+
+    # The loader probe gets a throwaway config carrying this one field, rather
+    # than the user's own settings, because the question is only ever "does this
+    # value survive load_config" and every field is picked independently of the
+    # rest. Building it from `document` would mean constructing a Config from the
+    # file -- the exact lossy step this command now exists to avoid.
+    probe = Config()
+    setattr(probe, key, value)
+    if _loader_would_reject(probe, key, value):
+        _err(
+            "blurt: %s=%s is not a value blurt can use; nothing was written."
+            % (key, _format_value(value))
+        )
+        return 2
+
+    # Reported from the file rather than from a loaded Config on purpose: if the
+    # old value was one the loader rejects, the honest thing to show the user is
+    # what their file said, not the default blurt was quietly substituting for it.
+    before = document.get(key, getattr(Config(), key))
+    if not _merge_into_config_file(document, {key: value}, path):
+        return 1
+
+    _out("%s: %s -> %s" % (key, _format_value(before), _format_value(value)))
+    if before == value:
+        _out("  (that was already the value; the file was rewritten anyway)")
+    _out("Wrote %s" % path)
+
+    if key == "history_enabled" and value is True:
+        # Restate the cost at the moment it starts applying, not only in the
+        # explainer someone read to get here. This is the one setting in blurt
+        # that turns speech into a file.
+        _out("")
+        _out("blurt will now write your transcripts to disk (0600, in a 0700")
+        _out("directory, never leaving this machine). 'blurt learn' reads them;")
+        _out("'blurt learn --forget' deletes them.")
+
+    _out("")
+    _out("This takes effect the next time you start blurt.")
+    return 0
+
+
+def _cmd_config_show(cfg: Config, args: argparse.Namespace) -> int:
     """Print the resolved config, its path, and any command-line overrides."""
     path = default_config_path()
     _out("path   : %s" % path)
@@ -963,6 +1710,15 @@ def _cmd_config(cfg: Config, args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001
             usable = []
         _out("  engine  : %s" % (usable[0] if usable else "none available"))
+
+    _out("")
+    _out("to change one of these:")
+    _out("  blurt config set KEY VALUE   e.g. blurt config set cleanup_level standard")
+    _out("  blurt config get KEY         prints one value alone, for scripts")
+    if not cfg.history_enabled:
+        _out("")
+        _out("the transcript journal that 'blurt learn' needs is off. Turn it on with:")
+        _out("  blurt config set history_enabled true")
     return 0
 
 
@@ -998,8 +1754,12 @@ def _cmd_learn(cfg: Config, args: argparse.Namespace) -> int:
             _out("  words before they mean anything.")
         else:
             _out("  Recording is off (history_enabled = false), so there is nothing")
-            _out("  to learn from yet. See 'blurt learn' with no journal for how to")
-            _out("  turn it on.")
+            _out("  to learn from yet. Turn it on with:")
+            _out("")
+            _out("      blurt config set history_enabled true")
+            _out("")
+            _out("  That writes your dictations to disk; 'blurt learn --forget'")
+            _out("  deletes them again.")
         return 0
 
     report = _learn.analyze(
@@ -1026,6 +1786,13 @@ def _learn_explain_disabled(path: pathlib.Path) -> int:
 
     This is the only place the trade-off gets stated before the user opts in, so
     it states it plainly rather than selling the feature.
+
+    It used to end by naming the setting and showing the JSON to add. That was a
+    dead end in practice: on a fresh install the config file does not exist, so
+    "add this to ~/.config/blurt/config.json" means "create a directory and a
+    file, get the JSON right, and hope". Anyone unwilling to do that never saw
+    what `learn` does, which made the whole feature effectively invisible. It now
+    prints the one command that does it, which is why `config set` exists.
     """
     _out("blurt %s -- learn" % __version__)
     _out("")
@@ -1041,11 +1808,15 @@ def _learn_explain_disabled(path: pathlib.Path) -> int:
     _out("  'blurt learn --forget' deletes it. Everything else blurt does keeps your")
     _out("  speech transient, which is why this is off until you say otherwise.")
     _out("")
-    _out("  Turn it on by adding this to %s:" % default_config_path())
+    _out("  Turn it on with:")
     _out("")
-    _out('      { "history_enabled": true }')
+    _out("      blurt config set history_enabled true")
     _out("")
+    _out("  That writes %s for you." % default_config_path())
     _out("  Then dictate normally for a few days and run 'blurt learn' again.")
+    _out("")
+    _out("  To stop it again:            blurt config set history_enabled false")
+    _out("  To delete what it wrote:     blurt learn --forget")
     return 0
 
 
@@ -1152,12 +1923,31 @@ def _print_learn_dictionary_health(report: "_learn.Report") -> None:
 
 
 def _learn_apply(report: "_learn.Report", args: argparse.Namespace) -> int:
-    """Collect approvals and write them to the config file.
+    """Collect approvals and merge them into the config file.
 
-    Reloads the config from disk rather than reusing the in-memory one, because
-    that one has any ``--model`` / ``--cleanup`` overrides folded into it and those
-    are explicitly for one run. Persisting them here would turn a temporary
-    override into a permanent setting behind the user's back.
+    A MERGE, NOT A ROUND TRIP -- the same rule ``config set`` follows, arrived at
+    the same way. This used to call ``load_config()``, mutate the two fields it
+    cares about, and hand the whole dataclass to ``save_config()``. That is
+    exactly the destructive round trip :func:`_read_config_document` was written
+    to describe, and it destroyed real things: a key from a newer blurt was
+    deleted outright, and a value the loader rejects -- a typo'd
+    ``sample_rate: 999999`` -- was overwritten with the default, erasing the
+    evidence the user needed in order to find their own typo. Neither says
+    anything on screen. The command then signed off with "nothing here is
+    irreversible", which was false for both.
+
+    It writes ``dictionary`` and ``initial_prompt`` because those are the two
+    settings the user just approved changes to, and it writes each of them only
+    if it actually changed. Every other byte of meaning in the file is carried
+    across untouched, including keys this version of ``Config`` has never heard
+    of.
+
+    Reads the file rather than the config ``main`` resolved, which also keeps the
+    older guarantee intact: the resolved one has any ``--model`` / ``--cleanup``
+    overrides folded into it, those are for one run by construction, and
+    persisting them would turn a flag someone passed to try something into a
+    permanent setting. Reading the document cannot express an override at all,
+    which is a stronger version of the same promise than reloading was.
     """
     if not report.suggestions:
         return 0
@@ -1171,28 +1961,47 @@ def _learn_apply(report: "_learn.Report", args: argparse.Namespace) -> int:
         _out("Nothing accepted; your config is unchanged.")
         return 0
 
-    fresh = load_config()
-    before_dictionary = dict(fresh.dictionary)
-    before_prompt = fresh.initial_prompt
+    path = default_config_path()
+    document = _read_config_document(path)
+    if document is None:
+        # A config that exists and cannot be understood. _read_config_document
+        # has already said so and said what to do about it. Refusing is the whole
+        # point: the file is the only copy of a dictionary that may represent
+        # months of someone's speech, and this command's own suggestions are
+        # reproducible from the journal whereas that file is not.
+        return 1
 
-    fresh.dictionary = _learn.merged_dictionary(fresh.dictionary, accepted)
-    fresh.initial_prompt = _learn.merged_prompt(fresh.initial_prompt, accepted)
+    # Taken from the document rather than from a loaded Config so that entries
+    # the loader would have dropped survive being written back. `_pick_dictionary`
+    # discards individual malformed entries -- correct when reading, data loss
+    # when the result is what gets saved. Both merge helpers already tolerate a
+    # value of the wrong shape, so the raw JSON can be handed to them directly.
+    raw_dictionary = document.get("dictionary")
+    raw_prompt = document.get("initial_prompt")
+    before_dictionary = dict(raw_dictionary) if isinstance(raw_dictionary, dict) else {}
+    before_prompt = raw_prompt.strip() if isinstance(raw_prompt, str) else ""
 
-    added_entries = len(fresh.dictionary) - len(before_dictionary)
-    prompt_changed = fresh.initial_prompt != before_prompt
+    dictionary = _learn.merged_dictionary(raw_dictionary, accepted)
+    prompt = _learn.merged_prompt(raw_prompt, accepted)
+
+    added_entries = len(dictionary) - len(before_dictionary)
+    prompt_changed = prompt != before_prompt
 
     if not added_entries and not prompt_changed:
         _out("")
         _out("Everything accepted was already covered; your config is unchanged.")
         return 0
 
-    path = default_config_path()
-    try:
-        save_config(fresh, path)
-    except OSError as exc:
-        _err("")
-        _err("blurt: could not write %s (%s)" % (path, exc))
-        _err("  Nothing was changed.")
+    # Only the keys that moved. A `dictionary` that gained nothing is not
+    # rewritten to an equal value, because "equal" is a claim about the loader's
+    # view of it and this command does not have to make that claim.
+    changes: Dict[str, Any] = {}
+    if added_entries:
+        changes["dictionary"] = dictionary
+    if prompt_changed:
+        changes["initial_prompt"] = prompt
+
+    if not _merge_into_config_file(document, changes, path):
         return 1
 
     _out("")
@@ -1201,7 +2010,7 @@ def _learn_apply(report: "_learn.Report", args: argparse.Namespace) -> int:
         _out("  dictionary     : %d new entr%s"
              % (added_entries, "y" if added_entries == 1 else "ies"))
     if prompt_changed:
-        words = len(fresh.initial_prompt.split())
+        words = len(prompt.split())
         _out("  initial_prompt : now %d word%s" % (words, "" if words == 1 else "s"))
         if words >= _learn.MAX_PROMPT_WORDS:
             _out("                   (at the %d-word budget; further vocabulary will"
@@ -1209,7 +2018,11 @@ def _learn_apply(report: "_learn.Report", args: argparse.Namespace) -> int:
             _out("                    be skipped until you prune it by hand)")
     _out("")
     _out("These take effect the next time you start blurt.")
-    _out("Undo by editing %s -- nothing here is irreversible." % path)
+    _out(
+        "Only %s changed; everything else in %s is exactly as you left it."
+        % (" and ".join(sorted(changes)), path)
+    )
+    _out("Undo by editing that file -- entries were added, none replaced.")
     return 0
 
 
@@ -1320,9 +2133,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    cfg = _apply_overrides(load_config(), args)
-
     command = getattr(args, "command", None) or "run"
+
+    # `config set` is the one command that must not read the config file through
+    # load_config, for two reasons. It never uses the resolved config -- it merges
+    # into the raw JSON itself -- so the load would be pure waste, and it is waste
+    # with output: load_config warns about every field it fell back on, so a user
+    # with one imperfect setting saw the same warnings printed twice for one
+    # command, once here and once inside the subcommand. It also has a side
+    # effect, since load_config renames an unparseable config to `.bak` on its way
+    # past, and `set` refuses to touch a file it could not read.
+    #
+    # The overrides are still parsed and validated, just against the defaults, so
+    # `blurt --hotkey fn config set ...` is still refused rather than ignored.
+    setting_config = command == "config" and getattr(args, "config_action", None) == "set"
+
+    # `learn --apply` merges into the same raw JSON document `set` does, and owes
+    # the user the same refusal: a config file blurt could not parse must not be
+    # replaced, only reported. It cannot get that for free the way `set` does,
+    # because it genuinely has to load -- the report is built from
+    # `history_enabled`, `dictionary` and `initial_prompt`.
+    #
+    # And that load is destructive to the evidence. `load_config` renames an
+    # unparseable config to `.bak` on its way past, so by the time `_learn_apply`
+    # reads the document the file is GONE, `_read_config_document` sees a missing
+    # file, calls it a fresh install, and starts from the serialised defaults --
+    # writing a brand-new config over a user whose only copy had just been moved
+    # out from under them, and reporting success while doing it. Checking here,
+    # before anything can move the file, is the only place the answer is still
+    # true. `--forget` is excluded because it never touches the config at all.
+    applying_learn = (
+        command == "learn"
+        and bool(getattr(args, "apply", False))
+        and not bool(getattr(args, "forget", False))
+    )
+    if applying_learn and _read_config_document(default_config_path()) is None:
+        return 1
+
+    cfg = _apply_overrides(Config() if setting_config else load_config(), args)
+
     if command == "doctor":
         return _cmd_doctor(cfg, args)
     if command == "bench":

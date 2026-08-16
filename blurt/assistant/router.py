@@ -45,6 +45,7 @@ _KIND_TO_NAME = {
     "reminder": "reminder",
     "timer": "timer",
     "open_app": "open_app",
+    "revert": "revert",
 }
 
 

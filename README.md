@@ -25,7 +25,7 @@ git clone <clone-url> blurt
 cd blurt
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[whisper]"
+pip install -e .
 ```
 
 Then:
@@ -35,9 +35,19 @@ blurt doctor     # check the machine before trusting it
 blurt            # start listening
 ```
 
-The `[whisper]` extra pulls in `faster-whisper`, which is the engine you want.
-Installing without it gives you the CLI and the Apple Speech engine but no local
-Whisper.
+That is the whole install. `faster-whisper` (>= 1.2) is a base dependency, not an
+extra, because there is no second engine to fall back to: the `apple-speech`
+backend blurt ships is a rejection stub that always reports itself unavailable —
+three independent reasons, written out in
+`blurt/engines/apple_speech_engine.py`, the first being that on an Intel Mac it
+can quietly fall back to server-side recognition and upload your audio. An
+install without faster-whisper therefore produced a program that started, probed
+the hardware, and then died with `NoEngineAvailable`.
+
+It used to live behind a `[whisper]` extra. If your notes still say
+`pip install -e ".[whisper]"`, that command still works — the extra is
+deliberately kept, and is now empty, so an instruction that used to be correct
+stays a harmless no-op instead of becoming an error.
 
 The first run of a given model downloads its weights (roughly 75 MB for
 `base.en`) into `~/.cache/huggingface`. That is the only network call blurt ever
@@ -47,9 +57,35 @@ is never touched again.
 ### Optional extras
 
 ```sh
-pip install -e ".[whisper,speech]"   # adds the Apple Speech engine
-pip install -e ".[whisper,dev]"      # adds pytest
+pip install -e ".[dev]"      # pytest, for running the test suite
+pip install -e ".[speech]"   # pyobjc-framework-Speech
 ```
+
+`dev` adds pytest. It is the one to install if you are going to change anything —
+see [Development](#development).
+
+`speech` installs the PyObjC binding for Apple's `SFSpeechRecognizer`. It does
+**not** give you a working second engine. The `apple-speech` backend reports
+itself unavailable whether or not the binding is present, and `blurt doctor`
+prints the reason next to it. Install it only if you want to re-examine that
+rejection on your own machine; nothing in blurt's normal operation uses it.
+
+### A demo that needs no microphone
+
+```sh
+bash scripts/demo.sh
+```
+
+It exercises the parts of blurt that are pure logic: configuration resolution,
+the deterministic cleanup pass, the "undo that" path that takes cleanup back, and
+the learning loop that turns journalled transcripts into `dictionary` and
+`initial_prompt` suggestions. No microphone, no model download, no macOS — it
+runs on the checkout as-is.
+
+Which also means it demonstrates nothing about the part you will actually wait
+for. It does not record audio, does not load Whisper, and says nothing about
+transcription accuracy or latency on your hardware. `blurt bench` is the only
+thing that answers those, because it is the only one that runs the model.
 
 ## macOS permissions
 
@@ -188,12 +224,13 @@ Common cases:
 | Nothing happens on keypress | Accessibility not granted to your terminal |
 | Recording works, nothing pastes | Same, or secure input is active |
 | Silence recorded | Microphone not granted, or the wrong input device is selected |
-| No engine available | `pip install -e ".[whisper]"` was skipped |
+| No engine available | `faster-whisper` did not install, or does not import — `doctor` prints the error |
 | Long delay on first use only | One-time model download, or cold model load |
 | Every phrase is slow | Expected on Intel — see Performance |
 
 If `doctor` looks clean and it still misbehaves, run `blurt config` to confirm
-which settings are actually in effect and which file they came from.
+which settings are actually in effect and which file they came from, or
+`blurt config get KEY` for one of them on its own.
 
 ## Configuration
 
@@ -202,9 +239,48 @@ The file is optional; defaults apply when it is missing. A corrupt file is
 renamed to `config.json.bak` and defaults are used — a bad config never stops you
 dictating.
 
+You never have to write that file by hand:
+
+```sh
+blurt config                              # everything, and the path it came from
+blurt config get history_enabled          # -> false
+blurt config set history_enabled true     # turn on the journal 'blurt learn' reads
+blurt config set cleanup_level standard
+blurt config set hotkey right_ctrl
+```
+
+`get` prints the value and nothing else — no label, no quotes, no trailing
+commentary — so it can be piped or captured: `[ "$(blurt config get
+history_enabled)" = true ]` does what it looks like. Booleans print as
+`true`/`false`, which is exactly the spelling `set` accepts back.
+
+`set` takes one scalar setting at a time and validates it against the rules
+`load_config` already enforces rather than a second copy of them — including the
+numeric ranges it does not print. It serializes the change, reads it back through
+the loader, and refuses anything that would not survive the round trip, so
+`blurt config set sample_rate 3` is rejected outright instead of being saved and
+then silently replaced by the default on every launch. A rejected value writes
+nothing at all, which includes leaving the file non-existent on a fresh install.
+On/off settings accept `true/false`, `yes/no`, `on/off` or `1/0`, in any case.
+
+Two things `set` deliberately will not do:
+
+- **It never persists a command-line override.** `blurt --cleanup standard config
+  set history_enabled true` writes the journal setting and nothing else. `set`
+  reloads the file from disk rather than saving the config the current run
+  resolved, because `--cleanup` is a flag you passed to try something, not a
+  setting you chose.
+- **It refuses `dictionary`.** That setting holds many entries and is built by
+  `blurt learn --apply` from your own transcripts, which knows more about what
+  belongs in there than a single command-line word can.
+
+Changes take effect the next time blurt starts.
+
+Every setting, and what it is for:
+
 | Field | Type | Default | What it does |
 | ----- | ---- | ------- | ------------ |
-| `engine` | string | `"auto"` | ASR backend: `auto`, `faster-whisper`, or `apple-speech`. `auto` picks the best available. |
+| `engine` | string | `"auto"` | ASR backend: `auto`, `faster-whisper`, or `apple-speech`. `auto` picks the best available, which today means `faster-whisper` — `apple-speech` is the rejection stub described under [Install](#install) and never runs. |
 | `model` | string | `"auto"` | Whisper model: `auto`, `tiny.en`, `base.en`, `small.en`, and larger. `auto` picks by hardware tier. |
 | `hotkey` | string | `"right_option"` | Push-to-talk key. One of `right_option`, `left_option`, `right_cmd`, `right_ctrl`, `right_shift`, `left_cmd`, `left_ctrl`, `left_shift`. |
 | `cleanup_level` | string | `"light"` | `none` (trim only), `light` (casing, stutters, non-lexical filler, dictionary), `standard` (adds spoken punctuation and bounded self-correction). |
@@ -214,12 +290,12 @@ dictating.
 | `paste_delay_ms` | int | `120` | Wait after writing the clipboard before sending Cmd+V, so the target app sees the new contents. |
 | `clipboard_restore_ms` | int | `400` | Wait after pasting before restoring your previous clipboard. |
 | `cpu_threads` | int | `0` | Threads for the ASR engine. `0` means auto: physical cores, never logical. Raising it past physical cores makes things worse. |
-| `keep_raw_history` | bool | `true` | Keep the pre-cleanup transcript in memory for the session, so you can see what the model actually heard. In-memory only — writing transcripts to disk is a separate, opt-in setting (`history_enabled`). |
+| `keep_raw_history` | bool | `true` | Keep the pre-cleanup transcript in memory for the session, so you can see what the model actually heard. It is also what "undo that" hands back — see [Undo](#undo-getting-the-raw-transcript-back). In-memory only; writing transcripts to disk is a separate, opt-in setting (`history_enabled`). |
 | `dictionary` | object | `{}` | Literal replacements applied during cleanup, e.g. `{"kubernetes": "Kubernetes"}`. Useful for names and jargon the model gets wrong the same way every time. |
 | `initial_prompt` | string | `""` | Vocabulary hint passed to Whisper — names, jargon, acronyms it keeps mishearing. A *matching* prompt measurably improves accuracy; a mismatched one can hurt, so it is empty until you fill it with your own words. |
 | `assistant_enabled` | bool | `true` | Enable command mode (the voice assistant). |
 | `assistant_hotkey` | string | `"right_cmd"` | Hold-to-command key. Same key names as `hotkey`; must differ from it. |
-| `history_enabled` | bool | `false` | Write finished dictations to a journal on disk, so `blurt learn` can suggest `dictionary` and `initial_prompt` entries. **Off by default** — this is the only thing blurt writes to disk. See below. |
+| `history_enabled` | bool | `false` | Write finished dictations to a journal on disk, so `blurt learn` can suggest `dictionary` and `initial_prompt` entries. **Off by default** — this is the only thing blurt writes to disk. Turn it on with `blurt config set history_enabled true`. See below. |
 | `history_limit` | int | `2000` | Most journal records to keep. Older ones are dropped. |
 
 Anything can be overridden for a single run without editing the file:
@@ -241,11 +317,17 @@ neither is much use if you have to guess what to put in them.
 
 `blurt learn` closes that loop. Turn on the journal:
 
-```json
-{ "history_enabled": true }
+```sh
+blurt config set history_enabled true
 ```
 
-dictate normally for a few days, then:
+That creates `~/.config/blurt/config.json` for you if it does not exist yet, and
+prints what it is about to start doing. There is no JSON to author: asking
+someone to hand-write a config file at a path that does not exist on a fresh
+install, correctly, before they can try a feature is the same as not shipping the
+feature — which is roughly what happened to this one until `config set` existed.
+
+Then dictate normally for a few days, and:
 
 ```sh
 blurt learn              # show what it found; changes nothing
@@ -304,10 +386,10 @@ it is off until you switch it on rather than on until you notice.
 The journal lives at `~/.local/share/blurt/history.jsonl` (or under
 `$XDG_DATA_HOME`), mode `0600` inside a `0700` directory. It is one JSON object
 per line, so you can read, grep or edit it with the tools you already have. It
-never leaves your machine — blurt has no network path to send it down. Setting
-`keep_raw_history: false` means only cleaned text is journalled, which weakens
-some of the findings; `blurt learn` says so rather than reporting less and
-looking confident about it.
+never leaves your machine — blurt has no network path to send it down. Turning
+raw history off (`blurt config set keep_raw_history false`) means only cleaned
+text is journalled, which weakens some of the findings; `blurt learn` says so
+rather than reporting less and looking confident about it.
 
 `blurt learn --forget` deletes it. That is a plain unlink: on a copy-on-write
 filesystem like APFS it does not reliably destroy the underlying blocks, so it is
@@ -352,6 +434,7 @@ say as a *command* instead of text to paste. Hold it, speak, release:
 | "remind me to call the dentist" | Creates a reminder |
 | "set a timer for 5 minutes" | Starts a timer, notifies you when it's up |
 | "open Safari" | Launches the app |
+| "undo that" | Gives back the raw transcript of your last *dictation* — never of a command — see [Undo](#undo-getting-the-raw-transcript-back) |
 | anything it doesn't recognise | Falls back to dictation — nothing is lost |
 
 It is **fully local**. Calendar and reminders go through macOS EventKit on your
@@ -376,6 +459,195 @@ default and never sends anything anywhere until you turn it on.
 
 Turn command mode off, or change its key, in the config (`assistant_enabled`,
 `assistant_hotkey`).
+
+## Undo: getting the raw transcript back
+
+blurt cleans up every dictation before it types it, and does so by default
+(`cleanup_level = light`). This is the mechanism that makes leaving that on
+defensible: if the cleanup pass mangles a sentence, you can get back exactly what
+the engine heard.
+
+Hold the **command-mode** hotkey — Right Command by default — say "undo that",
+release. blurt inserts the raw transcript at your cursor: the engine's output
+before casing, stutter collapsing, filler removal or dictionary replacement.
+
+It rides on command mode rather than having a hotkey of its own. That costs no
+extra macOS permission, adds no third key to bind and get wrong, and reuses a
+capture path that already works — see
+[Command mode](#command-mode-the-voice-assistant).
+
+You can watch this without a Mac. Section 4 of `bash scripts/demo.sh` puts a
+canned transcript through the real cleanup pass, the real intent router and the
+real `revert_last`, and names the three pieces it has to substitute — the ASR
+engine, the paste layer, the hotkeys — in the code that substitutes them.
+
+### It undoes your last dictation, never a command
+
+Only things you dictated are candidates. Command-mode utterances are kept out of
+the buffer the undo reads from, including the "undo that" itself.
+
+That exclusion is load-bearing rather than tidiness. "undo that" is a capture
+like any other, so if commands were recorded there, the newest entry at the
+moment you asked would always be the undo — and blurt would paste the words
+"undo that" into your document. It compounds, too: each retry would push the
+dictation you actually wanted one slot further out of reach, so you could never
+speak your way back to it.
+
+So "dictate a sentence → ask for a timer → say undo that" gives you back the
+sentence, not the timer. The on-disk journal (`history_enabled`) records both
+modes; the undo buffer is deliberately narrower than the journal is.
+
+### What it does not do
+
+blurt inserts the raw text. It **cannot delete the cleaned text it typed a moment
+earlier**, so you remove that yourself. It says so at the time rather than
+leaving you to notice:
+
+```
+  reverting to raw transcript (delete the cleaned text above it):
+```
+
+The reason is that `blurt.inject` exposes pasting and nothing else. There is no
+path for sending backspaces, and adding one would mean guessing where the caret
+now sits in an application blurt cannot see — you may have clicked elsewhere,
+typed something, or switched apps between the dictation and the undo. Guess wrong
+by a few characters and the deletion eats a sentence somebody wrote by hand. Two
+copies of a sentence on screen is a visible problem you fix in a second; silently
+deleting the wrong text in someone else's document is the failure this whole
+project is arranged to avoid.
+
+### A blocked paste is reported, and costs you nothing
+
+The undo counts as done only when macOS accepted the paste. When the paste is
+refused — secure input is active, Accessibility is not granted — blurt says so,
+and does **not** spend the undo on it:
+
+```
+  The revert did NOT go through -- nothing was inserted.
+  This dictation is still revertible: say it again once pasting works.
+```
+
+Fix the cause, say "undo that" again, and it works. That matters more than it
+sounds: the premise of command mode is that you are looking at some *other*
+application, so a cheerful "Reverted to the raw transcript." notification over a
+paste that never happened would be the only thing you saw, while the raw text sat
+on a clipboard blurt overwrites on your next dictation. The feature would be gone
+for that dictation, permanently, and it would have said so nowhere you were
+looking.
+
+One honest ceiling on the success case: "macOS accepted the paste" is not "the
+characters appeared on screen". Nothing on macOS reports the second, so blurt
+does not claim it. A refusal, on the other hand, macOS *does* report — which is
+why the refusal is the case that gets handled and the success is only ever
+claimed as far as it is known.
+
+### The rest of the limits, stated up front
+
+- **`keep_raw_history` must be true** (it is, by default). The raw text is what
+  revert restores; with it off there is nothing to restore, and blurt says
+  `cannot revert: raw history is disabled` instead of pasting something. This is
+  the in-memory session history, not the on-disk journal — undo does not need
+  `history_enabled`.
+- **Reverting the same dictation twice is a no-op.** The second attempt reports
+  "that dictation was already reverted" and inserts nothing.
+- **Command mode must be on** (`assistant_enabled`, default true). With it off,
+  or with its hotkey colliding with the dictation hotkey, the undo is simply
+  unreachable — which is the honest outcome; there is no key that silently does
+  nothing.
+- It also declines, naming the reason each time, when nothing has been dictated
+  yet, and when cleanup did not change that dictation at all.
+
+### What counts as "undo that"
+
+Two conditions, and both have to hold:
+
+1. **The whole utterance is the command.** Matching is anchored at both ends and
+   has no wildcard in it anywhere, so a sentence that merely *contains* one of
+   these phrases is never a match.
+2. **At most six words**, counted after punctuation is stripped.
+
+What follows is a list, not a grammar. Phrases that look like near neighbours of
+these often do not work, and that is deliberate — see the note under "raw text"
+below.
+
+**`undo` / `revert`**, alone or followed by one object from a closed list —
+`that`, `this`, `it`, `last`, `the last`, `that one`, `this one`, `the last one`,
+`the last thing`, `the last dictation`, `the last transcript`, `the cleanup`:
+
+```
+undo                        revert
+undo that                   revert that
+undo the last one           revert the last dictation
+undo the last thing         revert the cleanup
+```
+
+"undo the migration" and "revert to the previous vendor" name objects that are
+not on that list, so they are typed out.
+
+**`scratch that`**, `scratch this`, `scratch it`, `scratch that one`. Not
+"scratch the plan" — wrong object — and not "scratch that itch", where the anchor
+is the entire difference between it and a real command.
+
+**Corrections**: `that's` or `it's`, then `wrong` / `not right` /
+`not what I said`, then `undo` or `revert`, then optionally `it` or `that`.
+
+```
+that's wrong, undo it
+it's not right, revert
+that's not what I said, undo
+```
+
+The third line is where the six-word ceiling bites. *"that's not what I said,
+undo it"* is seven words and is typed out, not obeyed; dropping the trailing
+"it" is what makes it a command.
+
+**`never mind`** (or `nevermind`, or `nvm`) followed by `undo` or `revert`, and
+optionally `it` / `that` / `that one`. Bare "never mind" is not an undo — it is
+ordinary speech, so the explicit verb is required.
+
+**Raw text — exactly these five, and nothing adjacent to them:**
+
+```
+use the raw text
+use the raw transcript
+give me the raw text
+show me the raw text
+paste the raw version
+```
+
+"paste the raw **text**" does not work. Neither does "use the raw version",
+"give me the raw transcript", "use raw" or "i want raw". There is no rule
+generating those five; they are typed out one at a time in
+`blurt/assistant/intents.py`, and adding a sixth means answering one question
+first: is there a plausible English sentence where somebody says exactly this, as
+their whole utterance, and does not mean "undo my last dictation"? "I want raw"
+is a sentence about sushi, or a file format, or a camera setting, so it is not on
+the list. None of these five is load-bearing anyway — "undo that" is what people
+actually say, and if one of the five ever fires on real dictation the fix is to
+delete the line.
+
+Anything above may be preceded by `please`, `hey`, `ok`/`okay`, `so`, `just`,
+`um` or `uh`, and followed by `please`, as long as the whole thing stays inside
+six words: *"please give me the raw text"* is a command, *"please give me the raw
+text please"* is seven words and is typed out. Casing, spacing and trailing
+punctuation do not matter — "Undo that." is "undo that".
+
+Sentences that merely contain the word are dictated as text, which is what you
+want. All of these get typed, not obeyed:
+
+```
+undo the last commit in git and force push
+I need to undo the migration before the deploy, can you note that
+we should revert to the previous vendor
+the revert button is greyed out in the admin panel
+scratch that itch
+```
+
+That strictness is the asymmetric-risk rule pointing the other way for once.
+Everywhere else in blurt the cheap mistake is failing to act — you lose a second
+and say it again. Here a false positive pastes a stale transcript into whatever
+you happened to be typing, and for the reason above blurt cannot take it back. A
+missed undo costs a repeat; a spurious one costs you a document.
 
 ## What it deliberately does not do
 
@@ -408,6 +680,54 @@ rather than transcribing it.
 The governing principle throughout is asymmetric risk. Failing to clean something
 costs you a second of editing. Deleting something you actually said is a silent
 corruption you might not notice until it matters.
+
+## Development
+
+```sh
+python3 -m pytest -q
+```
+
+No install required. `tests/conftest.py` puts the repository root on `sys.path`,
+so `import blurt` resolves straight from the checkout — which is not a test
+convenience, it is how blurt actually runs on the floor machine, where there is
+no Homebrew, no virtualenv and no `pip install` of the project itself. You need
+`pytest` and `numpy` and nothing else; `pip install -e ".[dev]"` gets pytest.
+
+The suite is deliberately hardware-free: no microphone, no model download, no
+network, no Accessibility or Microphone prompts. That is what lets it run
+unattended, and on Linux. A test that needs a real device belongs behind a skip,
+not in the default run.
+
+### The Python 3.9 floor
+
+3.9 is not the oldest version grudgingly tolerated — it is the version the
+primary target is on. Apple's `/usr/bin/python3` on macOS 13 is 3.9.6, and blurt
+is expected to work there with nothing installed but its own dependencies. Newer
+syntax does not degrade on that interpreter; it raises `SyntaxError` at import,
+which means the app does not start at all. So in every module under `blurt/`:
+
+- `from __future__ import annotations` at the top, without exception.
+- `typing.Dict` / `List` / `Optional` / `Tuple`, never a builtin generic
+  evaluated at runtime (`x = dict[str, str]`, `cast(list[int], v)`).
+- No PEP 604 unions — `Optional[X]`, not `X | None`.
+- No `match` / `case`.
+
+### CI
+
+`.github/workflows/ci.yml` runs the suite on `ubuntu-latest` and `macos-latest`
+across Python 3.9 – 3.13. The macOS legs skip 3.9, 3.10 and 3.12: there is no
+arm64 macOS build of 3.9 to install, and what those legs are for is catching
+platform assumptions rather than repeating version coverage. Seven jobs in total.
+
+A second, cheaper job guards the floor without waiting on a 3.9 interpreter: it
+byte-compiles every module, checks that each one carries the future import, and
+greps for the constructs listed above.
+
+CI never installs blurt itself, and a change should not make it need to. Two
+reasons, either sufficient: the pyobjc wheels are macOS-only, so `pip install -e .`
+cannot resolve on a Linux runner at all; and `faster-whisper` is a base
+dependency now rather than an extra, so any install drags in CTranslate2 and its
+shared objects on every leg of the matrix, none of which the suite imports.
 
 ## Credits and licence
 

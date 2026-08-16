@@ -75,6 +75,10 @@ _log = logging.getLogger(__name__)
 #: How many finished dictations to keep in memory. Small on purpose: this is a
 #: convenience buffer for revert_last(), not a transcript archive, and dictated
 #: text is exactly the kind of thing that should not accumulate in RAM forever.
+#: Dictations only -- command-mode captures are never counted here, because an
+#: "undo that" that landed in this buffer would become the target of the next
+#: revert instead of the dictation the user is asking for back. The on-disk
+#: journal is where a record of both modes belongs.
 HISTORY_LIMIT = 20
 
 #: Longest we wait for an in-flight transcription during shutdown. Generous
@@ -124,10 +128,13 @@ class BlurtApp:
             app.shutdown()
 
     Thread model: :meth:`startup`, :meth:`run` and :meth:`shutdown` belong to the
-    main thread. Hotkey callbacks arrive on pynput's dispatch thread and do only
-    cheap work. All transcription happens on one private worker thread, so
-    dictations are serialised and can never overlap -- which also means the engine
-    never sees a concurrent :meth:`transcribe`, something the engines do not support.
+    main thread. Hotkey callbacks do only cheap work and arrive on a HoldToTalk
+    dispatch worker -- note the plural: dictation and assistant each own one, so
+    the capture callbacks really are concurrent with each other and the recorder
+    claim is taken under ``_capture_lock``. All transcription happens on one
+    private worker thread, so dictations are serialised and can never overlap --
+    which also means the engine never sees a concurrent :meth:`transcribe`,
+    something the engines do not support.
     """
 
     def __init__(self, cfg: Optional[Config] = None, hw: Optional[Hardware] = None) -> None:
@@ -146,6 +153,12 @@ class BlurtApp:
         # capture is handed to the worker. Guards against both keys at once by
         # ignoring a second start while one is already armed.
         self._capture_mode: Optional[str] = None
+        # Guards every read-modify-write of _capture_mode. Not paranoia: the two
+        # HoldToTalk instances above each run their OWN "blurt-hotkey-worker"
+        # thread, so _begin/_end/_cancel_capture are genuinely called from two
+        # different threads that share one Recorder. See _begin_capture for what
+        # the unsynchronised version corrupted.
+        self._capture_lock = threading.Lock()
 
         self._jobs: "queue.Queue[Any]" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
@@ -163,13 +176,28 @@ class BlurtApp:
 
     @property
     def history(self) -> List[Transcript]:
-        """Finished dictations, oldest first. A copy; safe to iterate."""
+        """Finished DICTATIONS, oldest first. A copy; safe to iterate.
+
+        Command-mode captures are excluded, and that exclusion is load-bearing
+        rather than tidiness: this deque is what :meth:`revert_last` reaches into,
+        so a spoken "undo that" recorded here would make the undo command itself
+        the text the next revert pastes. :meth:`_handle_capture` tells the whole
+        story. A record of both modes exists -- on disk, in the journal, which is
+        the thing that is actually an archive.
+        """
         with self._history_lock:
             return list(self._history)
 
     @property
     def last_transcript(self) -> Optional[Transcript]:
-        """The most recent dictation, or None if nothing has been said yet."""
+        """The most recent DICTATION, or None if nothing has been dictated yet.
+
+        Command-mode captures leave this untouched: saying "undo that" does not
+        make "undo that" the last transcript, which is precisely what lets a
+        revert still reach the dictation spoken before it. Non-None here means
+        there is something a revert could target -- not that the last thing the
+        user said was a dictation.
+        """
         with self._history_lock:
             return self._history[-1] if self._history else None
 
@@ -337,6 +365,16 @@ class BlurtApp:
         every failure here degrades to "assistant off" with a warning rather than
         aborting startup. The router's dictate fallback is _deliver, so an
         unrecognised command is simply typed out.
+
+        :meth:`revert_last` is wired in here as ``revert_fn`` rather than being
+        given a global hotkey of its own. Speaking the undo is what makes it
+        reachable at all -- it was dead code otherwise, which is a bad thing for
+        the mechanism that justifies enabling cleanup by default. Routing it
+        through command mode also costs nothing: no additional macOS permission,
+        no third key to bind and get wrong, and it reuses the capture path that
+        already works. When the assistant is disabled the revert stays
+        unreachable, which is honest -- there is no key that silently does
+        nothing.
         """
         if not getattr(self.cfg, "assistant_enabled", False):
             return
@@ -352,7 +390,8 @@ class BlurtApp:
 
         try:
             self._router = build_default_router(
-                dictate_fallback=self._deliver_as_result
+                dictate_fallback=self._deliver_as_result,
+                revert_fn=self.revert_last,
             )
         except Exception as exc:  # noqa: BLE001 - assistant is optional
             _warn(f"  assistant unavailable: {type(exc).__name__}: {exc}")
@@ -377,9 +416,23 @@ class BlurtApp:
             self._router = None
 
     def _deliver_as_result(self, text: str) -> "ActionResult":
-        """Dictate fallback for the router: paste the text, report it as a result."""
-        self._deliver(text)
-        return ActionResult(ok=True, message=f"Dictated: {text}")
+        """Dictate fallback for the router: paste the text, report what happened.
+
+        ``ok`` now follows :meth:`_deliver`'s verdict instead of being hardcoded
+        True. :meth:`_handle_command` prints this result with an OK/x marker, so
+        a hardcoded True stamped "OK Dictated: ..." directly underneath
+        ``_deliver``'s own "Could not paste" block -- two lines of the same
+        output disagreeing about whether the words went anywhere.
+
+        The failure message still quotes the text. The words are on the
+        clipboard and nowhere else at that point, and a result that says only
+        "could not paste" leaves the user guessing which utterance it was about.
+        """
+        if self._deliver(text):
+            return ActionResult(ok=True, message=f"Dictated: {text}")
+        return ActionResult(
+            ok=False, message=f"Could not paste; it is on the clipboard: {text}"
+        )
 
     def _check_accessibility(self) -> None:
         """Warn -- do not fail -- when the host app is untrusted.
@@ -398,62 +451,137 @@ class BlurtApp:
 
     # -- hotkey callbacks ---------------------------------------------------
     #
-    # These run on pynput's dispatch thread. They must stay cheap: anything slow
-    # here delays the next key press.
+    # These run on a hotkey worker thread -- and there are TWO of them, one per
+    # HoldToTalk (dictation and assistant), each with its own private
+    # "blurt-hotkey-worker". Two facts follow, and both matter below: every touch
+    # of _capture_mode is concurrent with the other hotkey's, and anything slow
+    # here delays that hotkey's next callback.
 
     def _begin_capture(self, mode: str) -> None:
-        """Start recording for ``mode`` ("dictate" or "assistant").
+        """Claim the recorder for ``mode`` ("dictate" or "assistant") and record.
 
         If a capture is already in progress -- e.g. both hotkeys held at once --
         the second start is ignored, because one recorder cannot serve two takes.
+
+        WHY THE LOCK IS NOT DECORATION. This method runs on two different
+        threads: :mod:`blurt.hotkey` gives every HoldToTalk its own dispatch
+        worker, and blurt builds two of them. The previous check-then-set on
+        ``_capture_mode`` was therefore a race with a nasty payload. Both threads
+        could read None, both could start the one recorder, and the later
+        assignment would win -- and the damage only surfaced on release, where
+        the first key's :meth:`_end_capture` found a mode it did not own and
+        returned WITHOUT stopping, while the second key's release queued that
+        audio tagged with the WRONG mode. A dictation then arrived at the router
+        and was executed as a command. Claiming the mode is now indivisible, so
+        exactly one press owns any given take and the comment above is a
+        guarantee rather than a hope.
+
+        The claim is taken BEFORE ``recorder.start()`` -- there is no instant in
+        which the recorder is running unclaimed -- and released again if starting
+        raises, so one failed press cannot lock out every press after it for the
+        life of the process.
+
+        LOCK ORDERING. We call into the Recorder while holding ``_capture_lock``,
+        and the Recorder takes a lock of its own. That cannot invert: the
+        Recorder never calls back into BlurtApp, so its lock is a leaf, and the
+        only other thread that touches it (PortAudio's realtime callback) takes
+        that lock and nothing else. The ordering _capture_lock -> recorder lock
+        is the only one that exists. What we deliberately keep OUTSIDE the lock
+        is everything whose duration we do not control: printing (a terminal in
+        flow control can stall a write for an unbounded time) and the handoff to
+        the transcription worker.
         """
         recorder = self._recorder
         if recorder is None:
             return
-        if self._capture_mode is not None:
-            return  # already recording in some mode; do not clobber it
-        try:
-            recorder.start()
-        except AudioUnavailable as exc:
-            _warn(f"blurt: cannot record: {exc}")
+
+        failure = ""
+        with self._capture_lock:
+            if self._capture_mode is not None:
+                return  # already recording in some mode; do not clobber it
+            self._capture_mode = mode
+            try:
+                recorder.start()
+            except AudioUnavailable as exc:
+                self._capture_mode = None  # release the claim; the mic may come back
+                failure = str(exc)
+            except Exception as exc:  # noqa: BLE001 - never kill the worker thread
+                self._capture_mode = None
+                failure = f"{type(exc).__name__}: {exc}"
+
+        if failure:
+            _warn(f"blurt: cannot record: {failure}")
             return
-        except Exception as exc:  # noqa: BLE001 - never kill the listener thread
-            _warn(f"blurt: cannot record: {type(exc).__name__}: {exc}")
-            return
-        self._capture_mode = mode
         _say("  listening for a command..." if mode == "assistant" else "  recording...")
 
     def _end_capture(self, mode: str) -> None:
-        """Stop recording and queue the capture, tagged with its mode."""
-        recorder = self._recorder
-        if recorder is None or self._capture_mode != mode:
-            return  # not our capture (or none in progress)
-        try:
-            pcm = recorder.stop()
-            # Read the silence verdict NOW. It is per-recorder state that the next
-            # capture overwrites, and the worker may not look at it for seconds.
-            was_silent = recorder.last_capture_was_silent()
-            overflowed = recorder.last_capture_overflowed()
-        except Exception as exc:  # noqa: BLE001 - never kill the listener thread
-            _warn(f"blurt: capture failed: {type(exc).__name__}: {exc}")
-            self._capture_mode = None
-            return
-        finally:
-            self._capture_mode = None
+        """Stop recording and queue the capture, tagged with its mode.
 
-        # Hand off immediately. Transcription is seconds of work and does not
-        # belong on the thread that has to notice the next key press.
+        The test-and-clear of ``_capture_mode`` is atomic for the reason spelled
+        out in :meth:`_begin_capture`: exactly one thread may proceed to stop the
+        recorder for a given take, and the other hotkey's worker must see a mode
+        that is not its own and leave the recorder alone.
+
+        The claim is held until the capture AND its two verdict flags have been
+        read out, not merely until ``stop()`` returns. Those flags are
+        per-recorder state that the next ``start()`` resets, so releasing early
+        would let a press landing in that window hand this capture somebody
+        else's silence verdict -- and a wrong "nothing was heard" sends the user
+        to a permissions dialog for a dictation that was fine.
+        """
+        recorder = self._recorder
+        if recorder is None:
+            return
+
+        pcm: Any = None
+        was_silent = False
+        overflowed = False
+        failure = ""
+        with self._capture_lock:
+            if self._capture_mode != mode:
+                return  # not our capture (or none in progress)
+            try:
+                pcm = recorder.stop()
+                # Read the silence verdict NOW. It is per-recorder state that the
+                # next capture overwrites, and the worker may not look at it for
+                # seconds.
+                was_silent = recorder.last_capture_was_silent()
+                overflowed = recorder.last_capture_overflowed()
+            except Exception as exc:  # noqa: BLE001 - never kill the worker thread
+                pcm = None
+                failure = f"{type(exc).__name__}: {exc}"
+            finally:
+                self._capture_mode = None
+
+        if failure:
+            _warn(f"blurt: capture failed: {failure}")
+            return
+
+        # Hand off immediately, and outside the lock. Transcription is seconds of
+        # work and does not belong on the thread that has to notice the next key
+        # press.
         self._jobs.put((pcm, was_silent, overflowed, mode))
 
     def _cancel_capture(self, mode: str) -> None:
+        """Throw the in-flight capture away. Same claim rules as :meth:`_end_capture`.
+
+        The test-and-clear is atomic so a cancel can never stop a take that the
+        other hotkey started; without that, Esc during an assistant command could
+        silently kill a dictation recorded by the other key.
+        """
         recorder = self._recorder
-        if recorder is None or self._capture_mode != mode:
+        if recorder is None:
             return
-        try:
-            recorder.stop()  # discard the audio; nothing is queued
-        except Exception:  # noqa: BLE001 - cancelling must never raise
-            pass
-        self._capture_mode = None
+
+        with self._capture_lock:
+            if self._capture_mode != mode:
+                return
+            try:
+                recorder.stop()  # discard the audio; nothing is queued
+            except Exception:  # noqa: BLE001 - cancelling must never raise
+                pass
+            finally:
+                self._capture_mode = None
         _say("  cancelled")
 
     # Dictation hotkey callbacks.
@@ -545,8 +673,31 @@ class BlurtApp:
             engine=self._engine_label,
             latency_seconds=latency,
         )
-        with self._history_lock:
-            self._history.append(transcript)
+        # ONLY dictations enter this deque. It is the revert buffer -- the thing
+        # revert_last() reaches back into -- and not an archive of everything the
+        # user said; the journal below is the archive, and it keeps both modes.
+        #
+        # A command utterance must never become the thing a later revert targets.
+        # "undo that" is itself a capture, so appending it here would make it the
+        # newest entry by the time the router's revert handler runs, and the
+        # revert would paste the words "undo that" into the user's document
+        # instead of the dictation they were trying to get back. The
+        # raw == cleaned guard in revert_last does not save us, because cleanup
+        # capitalises: raw "undo that" is not cleaned "Undo that", so the two
+        # differ and the revert looks legitimate. It is self-perpetuating too --
+        # each retry appends another command and pushes the real dictation one
+        # slot further out of reach, so the user can never speak their way back
+        # to it. And it fails in the one direction blurt cannot walk back:
+        # blurt.inject can paste but cannot delete, so text wrongly typed into
+        # someone else's document stays there.
+        if mode == "dictate":
+            with self._history_lock:
+                self._history.append(transcript)
+        # The journal is deliberately NOT conditional. HistoryRecord carries a
+        # mode field precisely so the on-disk record can hold both kinds, and a
+        # user who switched journalling on asked for a record of what they said,
+        # not a record of half of it. Keeping commands out of the revert buffer is
+        # about what a revert may target; it is not a reason to forget them.
         self._journal(transcript, mode)
 
         self._report_timing(transcript)
@@ -624,8 +775,31 @@ class BlurtApp:
             f"{transcript.latency_seconds:.2f}s  ({transcript.engine})"
         )
 
-    def _deliver(self, text: str) -> None:
-        """Type the text, or leave it on the clipboard and say so. Never drop it."""
+    def _deliver(self, text: str) -> bool:
+        """Type the text, or leave it on the clipboard and say so. Never drop it.
+
+        Returns True when the paste apparently landed and False when it was
+        blocked and the words went to the clipboard instead. Both outcomes keep
+        the user's words -- that promise is the point of this method and it is
+        unchanged -- but they are emphatically not the same event, and a caller
+        that has to make a decision on the strength of one needs to be able to
+        tell them apart. :meth:`revert_last` is the caller that must: it spends a
+        one-shot marker on the assumption the raw text arrived, and for the whole
+        of this method's previous life -- when it returned None -- it had no way
+        to find out, so it announced success into a terminal the user was not
+        looking at while the raw text sat on a clipboard blurt itself overwrites
+        on the next dictation.
+
+        The bool inherits ``inject.insert_text``'s caveat verbatim, and the
+        caveat is not a formality. True means the clipboard was written and the
+        Cmd+V events were posted with the permissions needed for them to be
+        delivered; it is NOT confirmation that the characters reached the screen,
+        because nothing on macOS reports that back. False is the stronger of the
+        two: the paste was refused before it was attempted (Secure Event Input,
+        no Accessibility, no pasteboard), so False may be read as "this did not
+        happen" while True may only ever be read as "the OS took it and will not
+        say more".
+        """
         ok = insert_text(
             text,
             paste_delay_ms=self.cfg.paste_delay_ms,
@@ -633,7 +807,7 @@ class BlurtApp:
         )
         if ok:
             _say(f"  {text}")
-            return
+            return True
 
         # Pasting was blocked. The words still belong to the user, so put them
         # somewhere they can retrieve them and explain what happened.
@@ -651,15 +825,55 @@ class BlurtApp:
             _warn("  Could not paste into the focused app.")
         _warn("  Your text is on the clipboard -- press Cmd+V to insert it:")
         _warn(f"  {text}")
+        return False
 
     # -- the trust mechanism ------------------------------------------------
 
     def revert_last(self) -> bool:
-        """Re-insert the RAW text of the last dictation, replacing the cleaned one.
+        """Re-insert the RAW text of the last DICTATION, replacing the cleaned one.
+
+        The last dictation, never a command. Command-mode captures are kept out
+        of ``_history`` by :meth:`_handle_capture`, so the "undo that" the user
+        just spoke to reach this method is not itself a candidate and the tail of
+        the deque is still the dictation they want back. Without that, the newest
+        entry at this moment would always be the undo command, and the revert
+        would paste the phrase "undo that" into the user's document -- into a
+        document blurt can add to but never delete from.
 
         This is the promise that makes cleanup safe to enable: if the cleanup pass
-        mangles something, one gesture (Opt+Z, once it is wired) gets back exactly
-        what the engine heard. Returns True if raw text was delivered.
+        mangles something, saying so ("undo that") gets back exactly what the
+        engine heard.
+
+        Returns True only when the raw text was actually delivered -- and it is
+        the same trip through :meth:`_deliver` that decides both the return value
+        and whether this dictation is marked as reverted. A blocked paste
+        (Secure Event Input, no Accessibility) returns False and marks nothing,
+        so the user can say it again once secure input clears. The earlier
+        version could not distinguish the two, because ``_deliver`` returned
+        None: a refused paste still returned True, still burned the one-shot
+        marker, and still fired an "OK Reverted to the raw transcript."
+        notification -- which is the only thing the user sees, since the whole
+        premise of command mode is that they are in another application. The
+        second attempt was then refused as "already reverted", and the raw text
+        was reachable only from a clipboard blurt overwrites on the next
+        dictation. The feature was gone for that dictation, permanently, and it
+        said so nowhere the user was looking. Note the ceiling this inherits from
+        ``_deliver``: True is "macOS accepted the events", never proof the
+        characters appeared -- there is no such proof to be had. It is enough for
+        the marker, because the failure it now excludes is the one macOS DOES
+        report.
+
+        WHICH THREAD. Now that it is reachable, this runs on the transcription
+        worker ("blurt-transcribe") -- the assistant's revert handler calls it
+        from inside :meth:`_handle_command`, which is itself worker work. That is
+        the right thread and the only one it is written for: :meth:`_deliver`
+        spends roughly half a second inside ``inject.insert_text`` (clipboard
+        write, Cmd+V, clipboard restore), which would be intolerable on a hotkey
+        dispatch worker and impossible on the main thread. ``_history_lock`` is
+        taken only for the snapshot read and is released well before that sleep,
+        so the ``history`` property never blocks behind a paste. ``_reverted_marker``
+        is deliberately left unguarded: the worker is serialised, so it is the
+        only thread that ever writes it.
 
         v1 limitation, stated plainly: blurt inserts the raw text at the cursor
         but cannot delete the cleaned text it typed earlier -- :mod:`blurt.inject`
@@ -693,8 +907,20 @@ class BlurtApp:
             _warn("  nothing to revert: cleanup did not change that dictation.")
             return False
 
+        # Announced before the attempt, because _deliver prints the raw text
+        # itself and this line is the instruction that has to arrive above it.
+        # It is phrased as an attempt in progress, not an outcome -- and when the
+        # attempt fails, the branch below supersedes it in as many words rather
+        # than leaving an optimistic line as the last thing on screen.
         _say("  reverting to raw transcript (delete the cleaned text above it):")
-        self._deliver(raw)
+        if not self._deliver(raw):
+            _warn("  The revert did NOT go through -- nothing was inserted.")
+            _warn("  This dictation is still revertible: say it again once pasting works.")
+            return False
+
+        # Only now. The marker is one-shot per dictation, so setting it on a
+        # paste that never landed spends the user's only remaining route back to
+        # their raw text on nothing.
         self._reverted_marker = transcript
         return True
 

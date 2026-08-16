@@ -5,12 +5,13 @@ returns an :class:`~blurt.assistant.types.Action` carrying everything needed to
 run it plus a confidence score; when it does not apply it returns ``None``. The
 router (see :mod:`.router`) asks every handler and runs the most confident match.
 
-Four handlers live here:
+Five handlers live here:
 
   * :class:`CalendarHandler`  -- "add / schedule / put ... on my calendar"
   * :class:`ReminderHandler`  -- "remind me to ...", "reminder to ..."
   * :class:`TimerHandler`     -- "set a timer for N minutes", "timer 10 minutes"
   * :class:`OpenAppHandler`   -- "open X", "launch X", "open the X app"
+  * :class:`RevertHandler`    -- "undo that", "revert", "scratch that"
 
 Design rules that matter here:
 
@@ -28,13 +29,17 @@ Design rules that matter here:
     traceback. A phrase nothing understands simply produces no match and the
     router falls through to dictation.
   * CREATE-ONLY / REVERSIBLE. These handlers only create events, reminders and
-    timers or open apps -- all reversible and harmless. Nothing here deletes or
-    overwrites anything (blurt's v1 safety rule). ``needs_confirmation`` is False
-    on every Action because the user triggered each one deliberately by voice and
-    every executed action returns a spoken-back message describing what happened.
+    timers, open apps, or paste text -- all reversible and harmless. Nothing here
+    deletes or overwrites anything (blurt's v1 safety rule); even
+    :class:`RevertHandler`, whose whole job is undoing, does it by *inserting*
+    the raw transcript rather than by deleting what was typed before.
+    ``needs_confirmation`` is False on every Action because the user triggered
+    each one deliberately by voice and every executed action returns a
+    spoken-back message describing what happened.
 
 Confidence scoring (kept simple and explicit, per the contract):
 
+  * an exact, whole-utterance command phrase -> certain (0.95)
   * command verb + a parsed time            -> high   (0.9)
   * unambiguous command verb but no time    -> medium (0.6)
   * weaker / plainer phrasing               -> low-ish (0.7 / 0.3)
@@ -730,9 +735,272 @@ class OpenAppHandler(IntentHandler):
             return ActionResult(ok=False, message="I couldn't open that app.")
 
 
+# --------------------------------------------------------------------------- #
+# RevertHandler
+# --------------------------------------------------------------------------- #
+# THE MATCHING RULE, STATED ONCE SO TESTS CAN CITE IT:
+#
+#   An utterance is a revert command only if, after normalization, it passes BOTH
+#   gates in :func:`_is_revert_command`:
+#
+#     1. it is at most _MAX_REVERT_WORDS words long, AND
+#     2. the WHOLE string is one of the fixed phrases below -- the pattern is
+#        anchored ``^...$``, so a match is never a substring of a longer sentence
+#        and no alternative is allowed to end in a wildcard tail.
+#
+# Both gates live in ONE function on purpose. They used to be two consecutive
+# checks inside match(), which is fine right up until someone adds a second entry
+# point -- a "would this match?" preview, a router fast-path, a test helper -- and
+# copies across only the regex. The ceiling then silently stops applying to that
+# path, and nothing fails: the funnel just gets wider. One gate, one call site,
+# no way to consult half of it.
+#
+# The ceiling is load-bearing, not decoration. "please give me the raw text
+# please" is seven words and satisfies the pattern; the ceiling is the only thing
+# that turns it down. THE CHECK TO RE-RUN AFTER EDITING ANYTHING HERE: set
+# _MAX_REVERT_WORDS to a huge number and confirm behaviour actually changes. If
+# it does not, one of the two gates has stopped doing anything and this comment
+# is describing a defence that is no longer there.
+_MAX_REVERT_WORDS = 6
+
+# Things you can say you want undone. Longest alternatives first so a full match
+# is found without leaning on backtracking to fix the ordering.
+_REVERT_OBJECT = (
+    r"(?:the\s+last\s+dictation|the\s+last\s+transcript|the\s+last\s+thing|"
+    r"the\s+last\s+one|that\s+one|this\s+one|the\s+last|the\s+cleanup|"
+    r"that|this|it|last)"
+)
+
+# Only fillers people actually put in front of a two-word command. Kept short on
+# purpose: every prefix admitted here widens the mouth of the funnel.
+_REVERT_LEAD = r"(?:please\s+|hey\s+|ok(?:ay)?\s+|so\s+|just\s+|um\s+|uh\s+)*"
+
+# THE RAW-TEXT FAMILY IS A CLOSED LIST, NOT A GRAMMAR.
+#
+# This was written as (use|give me|paste|insert|i want|show me) + an optional
+# "the" + "raw" + an OPTIONAL noun. Six verbs times an optional article times an
+# optional noun is about sixty accepted phrases, and the optional noun is what
+# does the damage: it admits bare "use raw", "insert raw" and "i want raw".
+# "I want raw" is a sentence about sushi, or a file format, or a camera setting.
+# It is dictation, and firing on it pastes a stale transcript into whatever the
+# user was in the middle of writing.
+#
+# So the generated set is gone, replaced by the literal phrases below. There is
+# no rule that produces them, and that is the point: this list can only grow by
+# someone typing a new line here, which forces the audit question to be asked
+# once per spelling -- is there a plausible English sentence where a person says
+# exactly this, as their entire utterance, and does not mean "undo my last
+# dictation"? Near neighbours of the accepted five ("paste the raw text", "use
+# the raw version") are deliberately NOT admitted by pattern; each spelling gets
+# in one at a time or not at all.
+#
+# None of these five is load-bearing. "undo that", "revert that" and "scratch
+# that" are what people actually say. The raw phrasings are a convenience, and if
+# one of them ever turns out to fire on real dictation the correct fix is to
+# delete the line rather than qualify it -- a smaller vocabulary that is never
+# wrong beats a larger one that sometimes is.
+_REVERT_RAW_PHRASE = (
+    r"(?:use\s+the\s+raw\s+text"
+    r"|use\s+the\s+raw\s+transcript"
+    r"|give\s+me\s+the\s+raw\s+text"
+    r"|show\s+me\s+the\s+raw\s+text"
+    r"|paste\s+the\s+raw\s+version)"
+)
+
+# Every alternative below has been asked the audit question. Each either names an
+# undo verb outright ("undo", "revert", "scratch") or ends in one ("that's wrong
+# undo it", "never mind undo"), and each is closed at both ends by the anchors --
+# there is no ".*" anywhere in this pattern and there must never be one.
+_REVERT_PHRASE_RE = re.compile(
+    r"^"
+    + _REVERT_LEAD
+    + r"(?:"
+    # "undo", "revert", "undo that", "revert the last dictation", "undo last".
+    # The object is a closed list too: "undo the migration" and "revert to the
+    # previous vendor" name objects that are not on it, so they do not match.
+    r"(?:undo|revert)(?:\s+" + _REVERT_OBJECT + r")?"
+    # "that's wrong, undo it" -- the correction people blurt out mid-sentence.
+    # The ceiling clips the longest spellings of this one ("it's not what i said
+    # undo it" is seven words). That is the ceiling winning, which is the
+    # intended precedence: a missed revert costs a repeat.
+    r"|(?:that'?s|it'?s)\s+(?:wrong|not\s+right|not\s+what\s+i\s+said)\s+"
+    r"(?:undo|revert)(?:\s+(?:it|that))?"
+    # "scratch that" (but NOT "scratch that itch" -- the anchor forbids a tail,
+    # and "scratch the plan" names an object that is not on the list).
+    r"|scratch\s+(?:that|this|it)(?:\s+one)?"
+    # "never mind undo". Bare "never mind" is NOT a revert: it is ordinary speech,
+    # so the explicit undo/revert verb is required.
+    r"|(?:never\s*mind|nvm)\s+(?:undo|revert)(?:\s+(?:it|that|that\s+one))?"
+    # The five enumerated raw-text phrases; see the note above.
+    r"|" + _REVERT_RAW_PHRASE + r")"
+    r"(?:\s+please)?"
+    r"$",
+    re.IGNORECASE,
+)
+
+# Punctuation that Whisper sprinkles into short commands ("Undo that."). Dropped
+# before matching so it cannot defeat the anchors. The apostrophe survives, so
+# "that's" stays "that's"; the regex above accepts both spellings anyway because
+# transcription drops it about as often as it keeps it.
+_REVERT_PUNCT_RE = re.compile(r"[.,;:!?\"()\[\]–—…“”]+")
+
+
+def _normalize_revert_text(text: str) -> str:
+    """Lower-case, de-punctuate and collapse whitespace for full-phrase matching.
+
+    Speech arrives as "Undo that." or " undo that, " or "Undo -- that"; none of
+    those should be a different command from "undo that". Curly apostrophes are
+    folded to straight ones because Whisper emits both.
+    """
+    s = text.replace("’", "'")
+    s = _REVERT_PUNCT_RE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _is_revert_command(normalized: str) -> bool:
+    """Both gates, in one place, so no caller can consult one without the other.
+
+    Takes ALREADY-normalized text (see :func:`_normalize_revert_text`) and applies
+    the word ceiling and the whole-utterance anchor together. The ceiling is
+    checked first only because it is the cheaper of the two; the order carries no
+    meaning, and a phrase must clear both.
+
+    Keeping this as a function rather than two lines in :meth:`RevertHandler.match`
+    is the whole safety story: a future caller that wants to ask "is this a revert
+    command?" gets both defences or neither. The alternative -- exporting the
+    compiled pattern and trusting each caller to remember the ceiling -- is how the
+    ceiling quietly stops applying.
+    """
+    if not normalized:
+        return False
+    if len(normalized.split(" ")) > _MAX_REVERT_WORDS:
+        return False
+    return _REVERT_PHRASE_RE.match(normalized) is not None
+
+
+class RevertHandler(IntentHandler):
+    """Recognize "undo that" and re-insert the RAW text of the last dictation.
+
+    This is the voice half of :meth:`blurt.app.BlurtApp.revert_last` -- the escape
+    hatch that makes running the cleanup pass by default defensible. If cleanup
+    mangles a sentence, saying "undo that" hands back exactly what the engine
+    heard. Until this handler existed, ``revert_last`` was unreachable code and
+    the promise was theoretical.
+
+    ASYMMETRIC RISK, POINTING THE OTHER WAY
+    ---------------------------------------
+    Everywhere else in blurt the cheap mistake is failing to act: you lose a
+    second and say it again. Here it is inverted. A false positive pastes a stale
+    raw transcript into whatever the user happened to be typing -- an email, a
+    commit message, someone else's document -- and blurt cannot take it back
+    (:mod:`blurt.inject` can paste but not delete; see ``revert_last``'s v1
+    limitation). A missed revert costs one repeat; a spurious one corrupts a
+    buffer the user was not thinking about.
+
+    That asymmetry is the justification for every conservative choice below. It
+    is also why the vocabulary is allowed to be small: the cost of an unrecognised
+    phrasing is that the user says "undo that" instead, and "undo that" is what
+    they were going to say anyway.
+
+    THE RULE
+    --------
+    An utterance is a revert command only if it clears BOTH gates in
+    :func:`_is_revert_command`:
+
+      * ANCHORING. The normalized utterance must match a fixed phrase as a
+        COMPLETE utterance -- the pattern is anchored ``^...$`` and contains no
+        wildcards, so matching is never substring matching and no alternative may
+        end in an open tail. "scratch that" is a command; "scratch that itch" is
+        not, and the only difference is the anchor. The accepted objects ("that",
+        "the last one", "the cleanup", ...) and the five raw-text phrasings are
+        both closed lists, enumerated literally rather than generated, so the
+        vocabulary cannot grow by accident.
+      * CEILING. At most ``_MAX_REVERT_WORDS`` (6) words, counted after
+        normalization. This is a second, cruder net that keeps holding if someone
+        later loosens the pattern; it is genuinely load-bearing today, because
+        "please give me the raw text please" satisfies the pattern and is turned
+        down by word count alone.
+
+    Adding a phrase means asking one question first: is there a plausible English
+    sentence where a person says exactly this, as their whole utterance, and does
+    not mean "undo my last dictation"? If yes, it does not go in. A smaller
+    vocabulary that is never wrong beats a larger one that sometimes is.
+
+    Concretely, these do NOT match, and must not:
+
+      * "I need to undo the migration before the deploy, can you note that"
+      * "undo the last commit in git and force push"
+      * "the revert button is greyed out in the admin panel"
+      * "scratch that itch"
+      * "i want raw", "use raw", "insert raw", "paste the raw text"
+
+    The first group is dictation that runs on past a revert-ish verb; the anchor
+    is the only thing separating the first two from a real command. The last line
+    is dictation that is SHORTER than a real command -- a sentence about sushi, a
+    file format, a camera setting -- and it is the reason the raw-text family is
+    an enumerated list of complete phrases instead of a verb-plus-"raw" grammar.
+
+    Confidence is 0.95 -- higher than any other handler. That is not swagger,
+    it is arithmetic: nothing here matches unless the entire utterance is a known
+    command phrase, so when it does match there is no competing reading left for
+    the router to weigh. It also guarantees a bare "undo" outranks any other
+    handler that might get creative about the word.
+
+    execute() calls the injected ``revert_fn`` (the app passes
+    ``BlurtApp.revert_last``) and translates its boolean into something sayable.
+    """
+
+    name = "revert"
+
+    def __init__(self, revert_fn: Callable[[], bool]) -> None:
+        self._revert_fn = revert_fn
+
+    def match(self, text: str) -> Optional[Action]:
+        try:
+            if not text or not text.strip():
+                return None
+
+            # One gate, both defences. Deliberately not inlined here: see
+            # _is_revert_command for why the ceiling and the anchor travel
+            # together.
+            if not _is_revert_command(_normalize_revert_text(text)):
+                return None
+
+            return Action(
+                kind="revert",
+                summary="Revert to the raw transcript",
+                payload={"_handler": self.name},
+                confidence=0.95,
+                needs_confirmation=False,
+            )
+        except Exception:
+            return None
+
+    def execute(self, action: Action) -> ActionResult:
+        """Run the revert and report it without contradicting the console.
+
+        ``revert_last`` has already printed the SPECIFIC reason it declined
+        (nothing dictated yet, already reverted, raw history off, cleanup changed
+        nothing). Restating a guess here would only risk disagreeing with it, so
+        the failure message says the one thing that is true in every case and
+        stops. A ``revert_fn`` that raises is treated the same as a decline: the
+        router would swallow the traceback anyway, but a handler that lets an
+        exception out of execute() is a handler that can lose the user's words
+        somewhere less forgiving.
+        """
+        try:
+            reverted = bool(self._revert_fn())
+        except Exception:
+            return ActionResult(ok=False, message="I couldn't revert that.")
+        if reverted:
+            return ActionResult(ok=True, message="Reverted to the raw transcript.")
+        return ActionResult(ok=False, message="Nothing to revert.")
+
+
 __all__ = [
     "CalendarHandler",
     "ReminderHandler",
     "TimerHandler",
     "OpenAppHandler",
+    "RevertHandler",
 ]
